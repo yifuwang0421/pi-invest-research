@@ -1,0 +1,250 @@
+import type {
+  DataGap,
+  LLMAdapter,
+  LLMGenerateRequest,
+  SubagentResult,
+} from "./schemas.js";
+import { SUBAGENT_PROFILES } from "./subagents.js";
+
+interface ChatMessage {
+  role: "system" | "user";
+  content: string;
+}
+
+interface ChatCompletionResponse {
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+}
+
+export interface OpenAICompatibleLLMOptions {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  fetchImpl?: typeof fetch;
+}
+
+export function createOpenAICompatibleLLMAdapter(options: OpenAICompatibleLLMOptions = {}): LLMAdapter {
+  return new OpenAICompatibleLLMAdapter(options);
+}
+
+export function createMockLLMAdapter(): LLMAdapter {
+  return createHeuristicLLMAdapter();
+}
+
+export function createHeuristicLLMAdapter(): LLMAdapter {
+  return {
+    async generateSubagentResult(request: LLMGenerateRequest): Promise<SubagentResult> {
+      return buildHeuristicResult(request);
+    },
+  };
+}
+
+class OpenAICompatibleLLMAdapter implements LLMAdapter {
+  private readonly apiKey: string | undefined;
+  private readonly baseUrl: string;
+  private readonly model: string;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(options: OpenAICompatibleLLMOptions) {
+    this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+    this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+
+  async generateSubagentResult(request: LLMGenerateRequest): Promise<SubagentResult> {
+    if (!this.apiKey) {
+      throw new Error("OPENAI_API_KEY is required for OpenAI-compatible LLM execution.");
+    }
+
+    const messages = buildMessages(request);
+    try {
+      const first = await this.callModel(messages);
+      return parseAndNormalize(first, request);
+    } catch (firstError) {
+      const repairMessages: ChatMessage[] = [
+        ...messages,
+        {
+          role: "user",
+          content: `上一次输出无法解析为有效 JSON。请只返回一个 JSON 对象，不要 Markdown，不要代码围栏。错误：${firstError instanceof Error ? firstError.message : String(firstError)}`,
+        },
+      ];
+      try {
+        const repaired = await this.callModel(repairMessages);
+        return parseAndNormalize(repaired, request);
+      } catch (secondError) {
+        return buildLLMFailureResult(request, secondError);
+      }
+    }
+  }
+
+  private async callModel(messages: ChatMessage[]): Promise<string> {
+    const endpoint = `${this.baseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await this.fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${this.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.model,
+        temperature: 0.2,
+        messages,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`LLM HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const payload = (await response.json()) as ChatCompletionResponse;
+    const content = payload.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("LLM response had no message content.");
+    }
+    return content;
+  }
+}
+
+function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
+  const profile = SUBAGENT_PROFILES[request.task.agent_id];
+  return [
+    {
+      role: "system",
+      content: [
+        "你是严谨的投资研究子 agent。",
+        "你运行在独立上下文、独立终端会话和独立工作区中，只能使用本次输入里的 task、evidence、data_gaps 和 upstream_results。",
+        "所有事实性判断必须引用 evidence_ids；无法由证据支持的内容必须放入 assumptions 或 data_gaps。",
+        "只返回 JSON 对象，不要 Markdown，不要代码围栏。",
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      content: JSON.stringify(
+        {
+          profile,
+          skill: request.skill_text,
+          normalized_request: request.normalized_request,
+          task: request.task,
+          delegation_context: request.delegation_context ?? request.task.delegation_context,
+          evidence: request.evidence,
+          data_gaps: request.data_gaps,
+          upstream_results: request.upstream_results ?? [],
+          required_shape: {
+            agent_id: request.task.agent_id,
+            task: "string",
+            summary: "string",
+            findings: [{ statement: "string", evidence_ids: ["string"], confidence: 0.0, is_assumption: false }],
+            assumptions: ["string"],
+            open_questions: ["string"],
+            confidence: 0.0,
+            needs_revision: false,
+          },
+        },
+        null,
+        2,
+      ),
+    },
+  ];
+}
+
+function parseAndNormalize(content: string, request: LLMGenerateRequest): SubagentResult {
+  const parsed = JSON.parse(extractJson(content)) as Partial<SubagentResult>;
+  const evidenceIds = new Set(request.evidence.map((item) => item.id));
+  const findings = Array.isArray(parsed.findings)
+    ? parsed.findings.map((finding) => ({
+        statement: typeof finding.statement === "string" ? finding.statement : "",
+        evidence_ids: Array.isArray(finding.evidence_ids)
+          ? finding.evidence_ids.filter((id): id is string => typeof id === "string" && evidenceIds.has(id))
+          : [],
+        confidence: clampConfidence(finding.confidence),
+        ...(finding.is_assumption ? { is_assumption: true } : {}),
+      })).filter((finding) => finding.statement.trim().length > 0)
+    : [];
+
+  return {
+    agent_id: request.task.agent_id,
+    task: request.task.task,
+    summary: typeof parsed.summary === "string" && parsed.summary.trim()
+      ? parsed.summary
+      : `${SUBAGENT_PROFILES[request.task.agent_id].name} 已完成分析。`,
+    findings,
+    evidence: request.evidence,
+    assumptions: normalizeStringArray(parsed.assumptions),
+    open_questions: normalizeStringArray(parsed.open_questions),
+    confidence: clampConfidence(parsed.confidence),
+    data_gaps: request.data_gaps,
+    needs_revision: Boolean(parsed.needs_revision) || findings.length === 0,
+  };
+}
+
+function buildHeuristicResult(request: LLMGenerateRequest): SubagentResult {
+  const profile = SUBAGENT_PROFILES[request.task.agent_id];
+  const evidenceIds = request.evidence.slice(0, 3).map((item) => item.id);
+  const hasEvidence = evidenceIds.length > 0;
+  return {
+    agent_id: request.task.agent_id,
+    task: request.task.task,
+    summary: hasEvidence
+      ? `${profile.name}基于 ${request.evidence.length} 条证据完成初步分析，仍需结合正式数据源复核。`
+      : `${profile.name}完成任务框架，但当前缺少可引用证据。`,
+    findings: [
+      {
+        statement: hasEvidence
+          ? `${request.task.target} 的${profile.name}已有可引用证据，可进入汇总评审。`
+          : `${request.task.target} 的${profile.name}判断缺少足够证据，暂列为待验证假设。`,
+        evidence_ids: evidenceIds,
+        confidence: hasEvidence ? 0.68 : 0.25,
+        ...(!hasEvidence ? { is_assumption: true } : {}),
+      },
+    ],
+    evidence: request.evidence,
+    assumptions: hasEvidence ? [] : [`${request.task.target} 的 ${request.task.agent_id} 结论需要补充真实数据验证。`],
+    open_questions: [],
+    confidence: hasEvidence ? 0.68 : 0.3,
+    data_gaps: request.data_gaps,
+    needs_revision: !hasEvidence && request.task.required_evidence.length > 0,
+  };
+}
+
+function buildLLMFailureResult(request: LLMGenerateRequest, error: unknown): SubagentResult {
+  const occurredAt = new Date().toISOString();
+  const gap: DataGap = {
+    source_name: "openai-compatible-llm",
+    query: request.task.task,
+    reason: error instanceof Error ? error.message : String(error),
+    occurred_at: occurredAt,
+  };
+  const fallback = buildHeuristicResult({
+    ...request,
+    data_gaps: [...request.data_gaps, gap],
+  });
+  return {
+    ...fallback,
+    needs_revision: true,
+    open_questions: [...fallback.open_questions, "LLM 输出未通过 JSON 结构校验，需要重新生成。"],
+  };
+}
+
+function extractJson(content: string): string {
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) return trimmed;
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) return trimmed.slice(start, end + 1);
+  throw new Error("LLM output did not contain a JSON object.");
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function clampConfidence(value: unknown): number {
+  if (typeof value !== "number" || Number.isNaN(value)) return 0.5;
+  return Math.max(0, Math.min(1, value));
+}

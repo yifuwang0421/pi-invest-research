@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local caches
+.npm-cache/
+.cache/
+.turbo/
+.vite/
+.parcel-cache/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Generated reports and run artifacts
+reports/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Package manager stores
+.pnpm-store/
+.yarn/
+!.yarn/releases/
+!.yarn/plugins/
+!.yarn/sdks/
+!.yarn/versions/

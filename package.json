@@ -1,0 +1,50 @@
+{
+  "name": "pi-invest-research",
+  "version": "0.1.0",
+  "description": "A standalone investment research CLI agent with Pi extension compatibility, analyst subagents, iFind MCP evidence, LLM execution, and review gates.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./extension": "./dist/src/extension.js",
+    "./cli": "./dist/src/cli.js"
+  },
+  "bin": {
+    "analyst-agent": "./dist/src/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "prompts",
+    "README.md"
+  ],
+  "scripts": {
+    "agent": "node dist/src/cli.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/tests/*.test.js",
+    "test:fixtures": "node --test dist/tests/orchestrator.test.js",
+    "smoke:ifind": "node dist/scripts/ifind-smoke.js"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "investment-research",
+    "agent",
+    "ifind",
+    "mcp"
+  ],
+  "pi": {
+    "extensions": ["./src/extension.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}
