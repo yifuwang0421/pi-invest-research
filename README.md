@@ -42,7 +42,7 @@ npm.cmd test
 离线验收不依赖 LLM key 或 iFinD token：
 
 ```powershell
-npm.cmd run agent -- --request "做宁德时代深度研究" --no-live-ifind --fixture tests/fixtures/basic-evidence.json --out reports/demo
+npm.cmd run agent -- --request "做宁德时代深度研究" --no-live-ifind --fixture --out reports/demo
 ```
 
 预期生成：
@@ -62,7 +62,7 @@ npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/maota
 也可以直接运行编译后的入口：
 
 ```powershell
-node dist/src/cli.js --request "做宁德时代深度研究" --no-live-ifind --fixture tests/fixtures/basic-evidence.json --out reports/catl
+node dist/src/cli.js --request "做宁德时代深度研究" --no-live-ifind --fixture --out reports/catl
 ```
 
 如需在任意目录使用 `analyst-agent` 命令，先执行：
@@ -92,7 +92,7 @@ npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/maota
 如需离线验证流程，但不调用真实 LLM，请加 `--fixture`：
 
 ```powershell
-npm.cmd run agent -- --request "做贵州茅台深度研究" --no-live-ifind --fixture tests/fixtures/basic-evidence.json --out reports/maotai-fixture
+npm.cmd run agent -- --request "做贵州茅台深度研究" --no-live-ifind --fixture --out reports/maotai-fixture
 ```
 
 ## CLI 参数
@@ -127,7 +127,7 @@ npm.cmd test
 离线 CLI：
 
 ```powershell
-npm.cmd run agent -- --request "做宁德时代深度研究" --no-live-ifind --fixture tests/fixtures/basic-evidence.json --out reports/acceptance-offline
+npm.cmd run agent -- --request "做宁德时代深度研究" --no-live-ifind --fixture --out reports/acceptance-offline
 ```
 
 真实 LLM：

@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildResearchPlan, selectSubagents } from "../src/orchestrator.js";
 
+test("general requests select evidence plus risk by default", () => {
+  assert.deepEqual(
+    selectSubagents("general", "Summarize CATL for a quick check"),
+    ["research_evidence", "risk_report"],
+  );
+});
+
 test("technical review selects evidence and risk/report agents", () => {
   assert.deepEqual(
     selectSubagents("technical_review", "只做贵州茅台近一个月技术面复盘"),

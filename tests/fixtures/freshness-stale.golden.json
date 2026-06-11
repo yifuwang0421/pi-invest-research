@@ -1,0 +1,42 @@
+{
+  "input": {
+    "source_type": "api",
+    "vendor": "stale-api",
+    "source_name": "stale-api",
+    "query": "CATL stale quote",
+    "target": "CATL",
+    "intent": "quote",
+    "retrieved_at": "2026-06-10T00:00:00.000Z",
+    "raw": {
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "A-share",
+      "price": 245.6,
+      "prev_close": 241.26,
+      "change_pct": 1.8,
+      "volume": 12345678,
+      "turnover": 3012345678,
+      "trade_date": "2025-11-23"
+    }
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 1,
+    "domain": "quote",
+    "schema": "quote.v1",
+    "value": {
+      "schema": "quote.v1",
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "A-share",
+      "price": 245.6,
+      "prev_close": 241.26,
+      "change_pct": 1.8,
+      "volume": 12345678,
+      "turnover": 3012345678,
+      "trade_date": "2025-11-23"
+    },
+    "reason_code": "stale_data",
+    "max_confidence": 0.8
+  }
+}

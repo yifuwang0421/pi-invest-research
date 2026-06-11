@@ -1,0 +1,34 @@
+{
+  "input": {
+    "source_type": "api",
+    "vendor": "macro-api",
+    "source_name": "macro-api",
+    "query": "China PMI",
+    "intent": "macro",
+    "retrieved_at": "2026-06-10T00:00:00.000Z",
+    "raw": {
+      "indicator_name": "PMI",
+      "region": "China",
+      "frequency": "monthly",
+      "value": 50.2,
+      "unit": "index",
+      "period": "2026-05"
+    }
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 0,
+    "domain": "macro",
+    "schema": "macro.v1",
+    "value": {
+      "schema": "macro.v1",
+      "indicator_name": "PMI",
+      "region": "China",
+      "frequency": "monthly",
+      "value": 50.2,
+      "unit": "index",
+      "period": "2026-05"
+    },
+    "min_confidence": 0.7
+  }
+}

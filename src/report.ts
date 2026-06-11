@@ -1,4 +1,5 @@
 import type { FinalReport, ResearchPlan, ReviewResult, SubagentExecutionTrace, SubagentResult } from "./schemas.js";
+import { dedupeEvidence, EVIDENCE_SCHEMA_VERSION } from "./evidence.js";
 import { SUBAGENT_PROFILES } from "./subagents.js";
 
 export function buildMarkdownReport(
@@ -6,7 +7,7 @@ export function buildMarkdownReport(
   subagentResults: SubagentResult[],
   reviews: ReviewResult[],
 ): string {
-  const evidence = subagentResults.flatMap((result) => result.evidence);
+  const evidence = dedupeEvidence(subagentResults.flatMap((result) => result.evidence));
   const dataGaps = subagentResults.flatMap((result) => result.data_gaps);
   const findings = subagentResults.flatMap((result) =>
     result.findings.map((finding) => ({ ...finding, agent_id: result.agent_id })),
@@ -95,18 +96,51 @@ export function buildFinalReport(
   reviewResults: ReviewResult[],
   delegationExecutions: SubagentExecutionTrace[] = [],
 ): FinalReport {
+  const normalizedSubagentResults = canonicalizeSubagentEvidence(subagentResults);
+  const evidenceLedger = dedupeEvidence(normalizedSubagentResults.flatMap((result) => result.evidence));
   return {
+    evidence_schema_version: EVIDENCE_SCHEMA_VERSION,
     target: plan.target,
     task_type: plan.normalized_request.task_type,
     selected_agents: plan.selected_agents,
-    markdown: buildMarkdownReport(plan, subagentResults, reviewResults),
-    evidence_ledger: subagentResults.flatMap((result) => result.evidence),
-    data_gaps: subagentResults.flatMap((result) => result.data_gaps),
+    markdown: buildMarkdownReport(plan, normalizedSubagentResults, reviewResults),
+    evidence_ledger: evidenceLedger,
+    data_gaps: normalizedSubagentResults.flatMap((result) => result.data_gaps),
     review_results: reviewResults,
     trace: {
       plan,
-      subagent_results: subagentResults,
+      subagent_results: normalizedSubagentResults,
       delegation_executions: delegationExecutions,
     },
   };
+}
+
+function canonicalizeSubagentEvidence(results: SubagentResult[]): SubagentResult[] {
+  const allEvidence = results.flatMap((result) => result.evidence);
+  const canonicalEvidence = dedupeEvidence(allEvidence);
+  const canonicalByKey = new Map(canonicalEvidence.map((item) => [item.quality?.dedupe_key ?? item.id, item]));
+  const canonicalIdByOriginalId = new Map<string, string>();
+
+  for (const item of allEvidence) {
+    const key = item.quality?.dedupe_key ?? item.id;
+    canonicalIdByOriginalId.set(item.id, canonicalByKey.get(key)?.id ?? item.id);
+  }
+
+  return results.map((result) => {
+    const evidenceById = new Map<string, SubagentResult["evidence"][number]>();
+    for (const item of result.evidence) {
+      const key = item.quality?.dedupe_key ?? item.id;
+      const canonical = canonicalByKey.get(key) ?? item;
+      evidenceById.set(canonical.id, canonical);
+    }
+
+    return {
+      ...result,
+      evidence: [...evidenceById.values()],
+      findings: result.findings.map((finding) => ({
+        ...finding,
+        evidence_ids: [...new Set(finding.evidence_ids.map((id) => canonicalIdByOriginalId.get(id) ?? id))],
+      })),
+    };
+  });
 }

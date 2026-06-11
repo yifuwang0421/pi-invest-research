@@ -1,0 +1,55 @@
+{
+  "input": {
+    "source_type": "ifind_mcp",
+    "vendor": "ifind",
+    "server": "stock",
+    "source_name": "hexin-ifind-ds-stock-mcp",
+    "query": "CATL quote",
+    "target": "CATL",
+    "intent": "quote",
+    "tool": "stock_quote",
+    "retrieved_at": "2026-06-10T01:00:00.000Z",
+    "raw": [
+      {
+        "symbol": "300750.SZ",
+        "name": "CATL",
+        "market": "A-share",
+        "price": 245.6,
+        "prev_close": 241.26,
+        "change_pct": 1.8,
+        "volume": 12345678,
+        "turnover": 3012345678,
+        "trade_date": "2026-06-10"
+      },
+      {
+        "symbol": "300750.SZ",
+        "name": "CATL",
+        "market": "A-share",
+        "price": 245.8,
+        "prev_close": 241.26,
+        "change_pct": 1.9,
+        "volume": 12349999,
+        "turnover": 3019999999,
+        "trade_date": "2026-06-10"
+      }
+    ]
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 0,
+    "domain": "quote",
+    "value": {
+      "schema": "quote.v1",
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "A-share",
+      "price": 245.6,
+      "prev_close": 241.26,
+      "change_pct": 1.8,
+      "volume": 12345678,
+      "turnover": 3012345678,
+      "trade_date": "2026-06-10"
+    },
+    "dedupe_warning": "deduped:"
+  }
+}

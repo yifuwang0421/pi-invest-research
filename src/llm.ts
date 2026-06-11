@@ -4,6 +4,7 @@ import type {
   LLMGenerateRequest,
   SubagentResult,
 } from "./schemas.js";
+import { summarizeEvidenceForLLM } from "./evidence.js";
 import { SUBAGENT_PROFILES } from "./subagents.js";
 
 interface ChatMessage {
@@ -24,6 +25,8 @@ export interface OpenAICompatibleLLMOptions {
   baseUrl?: string;
   model?: string;
   fetchImpl?: typeof fetch;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
 }
 
 export function createOpenAICompatibleLLMAdapter(options: OpenAICompatibleLLMOptions = {}): LLMAdapter {
@@ -47,12 +50,16 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly maxRetries: number;
+  private readonly retryBaseDelayMs: number;
 
   constructor(options: OpenAICompatibleLLMOptions) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
     this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.maxRetries = options.maxRetries ?? 2;
+    this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
   }
 
   async generateSubagentResult(request: LLMGenerateRequest): Promise<SubagentResult> {
@@ -62,7 +69,7 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
 
     const messages = buildMessages(request);
     try {
-      const first = await this.callModel(messages);
+      const first = await this.callModel(messages, request.signal);
       return parseAndNormalize(first, request);
     } catch (firstError) {
       const repairMessages: ChatMessage[] = [
@@ -73,7 +80,7 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
         },
       ];
       try {
-        const repaired = await this.callModel(repairMessages);
+        const repaired = await this.callModel(repairMessages, request.signal);
         return parseAndNormalize(repaired, request);
       } catch (secondError) {
         return buildLLMFailureResult(request, secondError);
@@ -81,32 +88,105 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
     }
   }
 
-  private async callModel(messages: ChatMessage[]): Promise<string> {
+  private async callModel(messages: ChatMessage[], signal?: AbortSignal): Promise<string> {
     const endpoint = `${this.baseUrl.replace(/\/$/, "")}/chat/completions`;
-    const response = await this.fetchImpl(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        temperature: 0.2,
-        messages,
-      }),
-    });
+    const maxAttempts = Math.max(1, this.maxRetries + 1);
 
-    if (!response.ok) {
-      throw new Error(`LLM HTTP ${response.status} ${response.statusText}`);
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        const init: RequestInit = {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            temperature: 0.2,
+            messages,
+          }),
+        };
+        if (signal) init.signal = signal;
+        const response = await this.fetchImpl(endpoint, init);
+
+        if (!response.ok) {
+          const error = new LLMHttpError(response.status, response.statusText, retryAfterMs(response.headers));
+          if (attempt < maxAttempts - 1 && isRetryableHttpStatus(response.status)) {
+            await delay(retryDelayMs(attempt, this.retryBaseDelayMs, error.retryAfterMs), signal);
+            continue;
+          }
+          throw error;
+        }
+
+        const payload = (await response.json()) as ChatCompletionResponse;
+        const content = payload.choices?.[0]?.message?.content;
+        if (!content) {
+          throw new Error("LLM response had no message content.");
+        }
+        return content;
+      } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw error;
+        if (attempt < maxAttempts - 1 && isRetryableNetworkError(error)) {
+          await delay(retryDelayMs(attempt, this.retryBaseDelayMs), signal);
+          continue;
+        }
+        throw error;
+      }
     }
 
-    const payload = (await response.json()) as ChatCompletionResponse;
-    const content = payload.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error("LLM response had no message content.");
-    }
-    return content;
+    throw new Error("LLM call failed without an execution attempt.");
   }
+}
+
+class LLMHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly statusText: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(`LLM HTTP ${status} ${statusText}`);
+  }
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function isRetryableNetworkError(error: unknown): boolean {
+  return error instanceof TypeError;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function retryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get("retry-after");
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return undefined;
+  return Math.max(0, timestamp - Date.now());
+}
+
+function retryDelayMs(attempt: number, baseDelayMs: number, retryAfter?: number): number {
+  if (retryAfter !== undefined) return retryAfter;
+  return Math.max(0, baseDelayMs * 2 ** attempt);
+}
+
+async function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(resolve, ms);
+    const abort = () => {
+      clearTimeout(timeout);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
@@ -130,7 +210,7 @@ function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
           normalized_request: request.normalized_request,
           task: request.task,
           delegation_context: request.delegation_context ?? request.task.delegation_context,
-          evidence: request.evidence,
+          evidence: summarizeEvidenceForLLM(request.evidence),
           data_gaps: request.data_gaps,
           upstream_results: request.upstream_results ?? [],
           required_shape: {

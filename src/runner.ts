@@ -19,6 +19,8 @@ export interface AnalystAgentRunOptions {
   outputDir?: string;
   fixturePath?: string;
   mockLLM?: boolean;
+  llmTimeoutMs?: number;
+  signal?: AbortSignal;
   llmAdapter?: LLMAdapter;
   evidenceProviders?: EvidenceProvider[];
 }
@@ -62,6 +64,8 @@ export async function runAnalystAgent(
     {
       evidenceProviders,
       llmAdapter,
+      ...(options.llmTimeoutMs !== undefined ? { llmTimeoutMs: options.llmTimeoutMs } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
       skillTextByAgent,
     },
   );
@@ -87,7 +91,11 @@ export async function writeRunArtifacts(
   const ledgerPath = resolve(dir, "evidence-ledger.json");
   const tracePath = resolve(dir, "trace.json");
   await writeFile(reportPath, report.markdown, "utf8");
-  await writeFile(ledgerPath, `${JSON.stringify(report.evidence_ledger, null, 2)}\n`, "utf8");
+  await writeFile(
+    ledgerPath,
+    `${JSON.stringify({ schema_version: report.evidence_schema_version, evidence: report.evidence_ledger }, null, 2)}\n`,
+    "utf8",
+  );
   await writeFile(tracePath, `${JSON.stringify(report.trace, null, 2)}\n`, "utf8");
   return {
     report: reportPath,

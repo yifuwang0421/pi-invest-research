@@ -9,6 +9,7 @@ interface CliArgs {
   taskType?: TaskType;
   out?: string;
   format?: OutputFormat;
+  llmTimeoutMs?: number;
   useLiveIFind: boolean;
   fixture?: string | true;
 }
@@ -37,6 +38,7 @@ async function main(): Promise<void> {
   const runOptions: AnalystAgentRunOptions = {
     outputDir,
     mockLLM: usesFixture,
+    ...(args.llmTimeoutMs !== undefined ? { llmTimeoutMs: args.llmTimeoutMs } : {}),
   };
   if (typeof args.fixture === "string") {
     runOptions.fixturePath = args.fixture;
@@ -103,6 +105,10 @@ function parseArgs(argv: string[]): CliArgs {
         args.format = requireValue(argv, index, token) as OutputFormat;
         index += 1;
         break;
+      case "--llm-timeout-ms":
+        args.llmTimeoutMs = requirePositiveInteger(requireValue(argv, index, token), token);
+        index += 1;
+        break;
       case "--no-live-ifind":
         args.useLiveIFind = false;
         break;
@@ -136,6 +142,14 @@ function requireValue(argv: string[], index: number, flag: string): string {
   return value;
 }
 
+function requirePositiveInteger(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer.`);
+  }
+  return parsed;
+}
+
 function defaultOutputDir(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `reports/run-${stamp}`;
@@ -154,6 +168,7 @@ Options:
   --task-type <type>     deep_research | technical_review | risk_review | valuation | news_event | general
   --out <dir>            输出目录，默认 reports/run-<timestamp>
   --format <format>      markdown | json，默认 markdown
+  --llm-timeout-ms <ms>  LLM subagent timeout in milliseconds, default 120000
   --no-live-ifind        不调用实时 iFinD
   --fixture [path]       使用 fixture 证据和 mock LLM 离线运行
 `);

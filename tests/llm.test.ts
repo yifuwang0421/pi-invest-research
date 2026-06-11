@@ -71,10 +71,82 @@ test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
     model: "test-model",
     fetchImpl,
   });
-  const result = await adapter.generateSubagentResult(makeLLMRequest());
+  const result = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    signal: new AbortController().signal,
+  });
 
   assert.equal(callCount, 2);
   assert.equal(result.summary, "修复后的结构化结果。");
+});
+
+test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async () => {
+  let callCount = 0;
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    callCount += 1;
+    assert.ok(init?.signal instanceof AbortSignal);
+    if (callCount === 1) {
+      return new Response(JSON.stringify({ error: "rate limited" }), {
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: { "retry-after": "0" },
+      });
+    }
+    return jsonResponse({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              summary: "retry ok",
+              findings: [{ statement: "evidence is available", evidence_ids: ["ev-1"], confidence: 0.6 }],
+              assumptions: [],
+              open_questions: [],
+              confidence: 0.6,
+              needs_revision: false,
+            }),
+          },
+        },
+      ],
+    });
+  };
+
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    retryBaseDelayMs: 0,
+  });
+  const result = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(callCount, 2);
+  assert.equal(result.summary, "retry ok");
+});
+
+test("OpenAI-compatible LLM adapter returns revision result after exhausted 5xx retries", async () => {
+  let callCount = 0;
+  const fetchImpl: typeof fetch = async () => {
+    callCount += 1;
+    return new Response(JSON.stringify({ error: "temporary" }), {
+      status: 503,
+      statusText: "Service Unavailable",
+    });
+  };
+
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    maxRetries: 1,
+    retryBaseDelayMs: 0,
+  });
+  const result = await adapter.generateSubagentResult(makeLLMRequest());
+
+  assert.equal(callCount, 4);
+  assert.equal(result.needs_revision, true);
+  assert.match(result.data_gaps.map((gap) => gap.reason).join("\n"), /503/);
 });
 
 test("OpenAI-compatible LLM adapter fails clearly without API key", async () => {

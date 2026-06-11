@@ -45,8 +45,8 @@ export function createInvestResearchTool(): PiToolDefinition {
       required: ["request"],
       additionalProperties: false,
     },
-    execute: async (_toolCallId, params) => {
-      const result = await investResearch(params);
+    execute: async (_toolCallId, params, signal) => {
+      const result = await investResearch(params, signal ? { signal } : {});
       if ("clarification_question" in result) {
         return {
           content: [{ type: "text", text: result.clarification_question }],

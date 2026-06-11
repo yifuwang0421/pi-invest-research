@@ -1,4 +1,5 @@
-import type { DataGap, IFindQueryRequest, IFindQueryResult, ResearchDataAdapters } from "./schemas.js";
+import { buildSourceMeta, extractJsonPayload, makeDataGap, normalizeRawEvidence } from "./evidence.js";
+import type { DataGapReasonCode, IFindQueryRequest, IFindQueryResult, ResearchDataAdapters } from "./schemas.js";
 
 type IFindServerKey = IFindQueryRequest["server"];
 
@@ -69,7 +70,13 @@ export class IFindMcpAdapter implements ResearchDataAdapters {
         return {
           evidence: [],
           data_gaps: [
-            makeGap(request, `iFind ${request.server} MCP 未返回可匹配工具。可用工具：${tools.map((item) => item.name).join(", ")}`, retrievedAt),
+            makeIFindGap(
+              request,
+              `iFind ${request.server} MCP returned no matching tool. Available tools: ${tools.map((item) => item.name).join(", ")}`,
+              "tool_missing",
+              retrievedAt,
+              endpoint,
+            ),
           ],
         };
       }
@@ -79,27 +86,30 @@ export class IFindMcpAdapter implements ResearchDataAdapters {
         arguments: buildToolArguments(tool, request),
       });
 
-      return {
-        evidence: [
-          {
-            id: makeEvidenceId(request.server, request.intent, request.target ?? request.query),
-            source_type: "ifind_mcp",
-            source_name: `hexin-ifind-ds-${request.server}-mcp`,
-            query: request.query,
-            as_of: retrievedAt.slice(0, 10),
-            retrieved_at: retrievedAt,
-            confidence: 0.82,
-            value: extractMcpValue(result),
-            raw_ref: `${endpoint}#${tool.name}`,
-          },
-        ],
-        data_gaps: [],
-      };
+      return normalizeRawEvidence({
+        source_type: "ifind_mcp",
+        vendor: "ifind",
+        server: request.server,
+        source_name: `hexin-ifind-ds-${request.server}-mcp`,
+        query: request.query,
+        ...(request.target ? { target: request.target } : {}),
+        intent: request.intent,
+        endpoint,
+        tool: tool.name,
+        retrieved_at: retrievedAt,
+        raw: result,
+      });
     } catch (error) {
       return {
         evidence: [],
         data_gaps: [
-          makeGap(request, error instanceof Error ? error.message : String(error), retrievedAt),
+          makeIFindGap(
+            request,
+            error instanceof Error ? error.message : String(error),
+            "transport_error",
+            retrievedAt,
+            endpoint,
+          ),
         ],
       };
     }
@@ -142,21 +152,17 @@ export function createMockIFindAdapter(): ResearchDataAdapters {
   return {
     async queryIFind(request: IFindQueryRequest): Promise<IFindQueryResult> {
       const now = new Date("2026-06-10T00:00:00.000Z").toISOString();
-      return {
-        evidence: [
-          {
-            id: makeEvidenceId(request.server, request.intent, request.target ?? request.query),
-            source_type: "mock",
-            source_name: `mock-ifind-${request.server}`,
-            query: request.query,
-            as_of: now.slice(0, 10),
-            retrieved_at: now,
-            confidence: 0.7,
-            value: { target: request.target, intent: request.intent, note: "fixture evidence" },
-          },
-        ],
-        data_gaps: [],
-      };
+      return normalizeRawEvidence({
+        source_type: "mock",
+        vendor: "ifind-mock",
+        server: request.server,
+        source_name: `mock-ifind-${request.server}`,
+        query: request.query,
+        ...(request.target ? { target: request.target } : {}),
+        intent: request.intent,
+        retrieved_at: now,
+        raw: buildMockPayload(request, now),
+      });
     },
   };
 }
@@ -192,29 +198,78 @@ function buildToolArguments(tool: McpTool, request: IFindQueryRequest): Record<s
   };
 }
 
-function extractMcpValue(result: unknown): unknown {
-  if (typeof result !== "object" || result === null) return result;
-  const candidate = result as { content?: Array<{ type?: string; text?: string }>; structuredContent?: unknown };
-  if (candidate.structuredContent !== undefined) return candidate.structuredContent;
-  const text = candidate.content?.find((item) => item.type === "text" && item.text)?.text;
-  return text ?? result;
-}
-
-function extractJsonPayload(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("event:") && !trimmed.startsWith("data:")) return trimmed;
-  const dataLine = trimmed
-    .split(/\r?\n/)
-    .find((line) => line.startsWith("data:"));
-  if (!dataLine) throw new Error("MCP SSE response had no data line");
-  return dataLine.slice("data:".length).trim();
-}
-
-function makeGap(request: IFindQueryRequest, reason: string, occurredAt: string): DataGap {
-  return {
-    source_name: `hexin-ifind-ds-${request.server}-mcp`,
+function makeIFindGap(
+  request: IFindQueryRequest,
+  reason: string,
+  reasonCode: Extract<DataGapReasonCode, "transport_error" | "tool_missing">,
+  occurredAt: string,
+  endpoint: string,
+) {
+  const sourceName = `hexin-ifind-ds-${request.server}-mcp`;
+  const raw = { reason, reason_code: reasonCode, server: request.server };
+  return makeDataGap({
+    source_name: sourceName,
     query: request.query,
     reason,
+    reason_code: reasonCode,
     occurred_at: occurredAt,
-  };
+    source_meta: buildSourceMeta({
+      source_type: "ifind_mcp",
+      vendor: "ifind",
+      server: request.server,
+      source_name: sourceName,
+      query: request.query,
+      ...(request.target ? { target: request.target } : {}),
+      endpoint,
+      retrieved_at: occurredAt,
+      raw,
+    }, raw),
+  });
+}
+
+function buildMockPayload(request: IFindQueryRequest, retrievedAt: string): unknown {
+  const target = request.target ?? request.query;
+  if (request.intent === "quote") {
+    return {
+      symbol: target,
+      name: target,
+      market: "A-share",
+      price: 245.6,
+      open: 242.1,
+      high: 248.2,
+      low: 240.3,
+      prev_close: 241.26,
+      change_pct: 1.8,
+      volume: 12345678,
+      turnover: 3012345678,
+      trade_date: retrievedAt.slice(0, 10),
+    };
+  }
+  if (request.intent === "financials") {
+    return {
+      symbol: target,
+      name: target,
+      period: "2026Q1",
+      report_type: "quarterly",
+      revenue: 79700000000,
+      net_profit: 10500000000,
+      gross_margin: 24.5,
+      roe: 6.7,
+      total_assets: 765000000000,
+      total_equity: 285000000000,
+      operating_cash_flow: 13200000000,
+      currency: "CNY",
+    };
+  }
+  if (request.intent === "news") {
+    return {
+      title: `${target} operating update`,
+      published_at: retrievedAt,
+      source: "mock-ifind",
+      related_symbols: [target],
+      summary: "Fixture evidence for offline validation.",
+      sentiment: "neutral",
+    };
+  }
+  return { target, intent: request.intent, note: "fixture evidence" };
 }

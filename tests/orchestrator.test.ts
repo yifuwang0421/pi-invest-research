@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createInvestResearchTool, createMockLLMAdapter, investResearch } from "../src/index.js";
+import { buildSubagentTask, runSubagentTask } from "../src/orchestrator.js";
 import { createMockIFindAdapter } from "../src/ifind-adapter.js";
-import type { FinalReport } from "../src/schemas.js";
+import type { FinalReport, LLMAdapter } from "../src/schemas.js";
 import { createEvidenceProviders } from "../src/sources.js";
 
 test("investResearch produces a Markdown report with the compressed three-agent pipeline", async () => {
@@ -65,4 +66,32 @@ test("extension tool registers and can execute", async () => {
 
   assert.match(result.content[0]?.text ?? "", /贵州茅台 投研分析报告/);
   assert.ok(typeof result.details === "object" && result.details !== null);
+});
+
+test("runSubagentTask times out a hanging LLM adapter", async () => {
+  const adapter: LLMAdapter = {
+    async generateSubagentResult(request) {
+      assert.ok(request.signal instanceof AbortSignal);
+      return await new Promise(() => undefined);
+    },
+  };
+
+  const result = await runSubagentTask(
+    buildSubagentTask("research_evidence", "CATL", "general"),
+    createEvidenceProviders(["fixture"]),
+    adapter,
+    {
+      request: "Summarize CATL",
+      target: "CATL",
+      task_type: "general",
+      output_format: "markdown",
+      sources: ["fixture"],
+    },
+    "",
+    [],
+    5,
+  );
+
+  assert.equal(result.needs_revision, true);
+  assert.match(result.data_gaps.map((gap) => gap.reason).join("\n"), /timed out/);
 });

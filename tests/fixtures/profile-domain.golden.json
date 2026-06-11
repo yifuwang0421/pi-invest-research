@@ -1,0 +1,35 @@
+{
+  "input": {
+    "source_type": "api",
+    "vendor": "company-api",
+    "source_name": "company-api",
+    "query": "CATL profile",
+    "target": "CATL",
+    "intent": "profile",
+    "retrieved_at": "2026-06-10T00:00:00.000Z",
+    "raw": {
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "A-share",
+      "industry": "Battery",
+      "business_scope": "Power batteries and energy storage systems",
+      "as_of": "2026-06-10"
+    }
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 0,
+    "domain": "profile",
+    "schema": "profile.v1",
+    "value": {
+      "schema": "profile.v1",
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "A-share",
+      "industry": "Battery",
+      "business_scope": "Power batteries and energy storage systems",
+      "as_of": "2026-06-10"
+    },
+    "min_confidence": 0.8
+  }
+}

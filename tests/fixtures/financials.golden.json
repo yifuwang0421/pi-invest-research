@@ -1,0 +1,54 @@
+{
+  "input": {
+    "source_type": "ifind_mcp",
+    "vendor": "ifind",
+    "server": "stock",
+    "source_name": "hexin-ifind-ds-stock-mcp",
+    "query": "CATL financial summary",
+    "target": "CATL",
+    "intent": "financials",
+    "tool": "stock_financials",
+    "retrieved_at": "2026-06-10T00:00:00.000Z",
+    "raw": {
+      "data": [
+        {
+          "symbol": "300750.SZ",
+          "name": "CATL",
+          "period": "2026Q1",
+          "report_type": "quarterly",
+          "revenue": 79700000000,
+          "net_profit": 10500000000,
+          "gross_margin": 24.5,
+          "roe": 6.7,
+          "total_assets": 765000000000,
+          "total_equity": 285000000000,
+          "operating_cash_flow": 13200000000,
+          "currency": "CNY"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 0,
+    "domain": "financials",
+    "schema": "financials.v1",
+    "value": {
+      "schema": "financials.v1",
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "period": "2026Q1",
+      "report_type": "quarterly",
+      "revenue": 79700000000,
+      "net_profit": 10500000000,
+      "gross_margin": 24.5,
+      "roe": 6.7,
+      "total_assets": 765000000000,
+      "total_equity": 285000000000,
+      "operating_cash_flow": 13200000000,
+      "currency": "CNY"
+    },
+    "dedupe_key": "ifind:financials:catl:2026q1:2026q1",
+    "min_confidence": 0.7
+  }
+}

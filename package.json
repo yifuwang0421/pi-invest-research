@@ -23,7 +23,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test dist/tests/*.test.js",
-    "test:fixtures": "node --test dist/tests/orchestrator.test.js",
+    "test:fixtures": "node --test dist/tests/evidence.test.js",
     "smoke:ifind": "node dist/scripts/ifind-smoke.js"
   },
   "keywords": [

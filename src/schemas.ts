@@ -29,6 +29,133 @@ export type EvidenceSourceType =
   | "mock"
   | "manual";
 
+export type EvidenceSourceServer = string;
+
+export type EvidenceDomain =
+  | "quote"
+  | "financials"
+  | "announcement"
+  | "news"
+  | "profile"
+  | "macro";
+
+export type EvidenceIntent = EvidenceDomain;
+
+export type EvidenceSchemaVersion = "evidence.v1";
+
+export type DataGapReasonCode =
+  | "transport_error"
+  | "tool_missing"
+  | "parse_error"
+  | "schema_invalid"
+  | "stale_data"
+  | "empty_result"
+  | "source_unavailable";
+
+export interface EvidenceSourceMeta {
+  vendor: string;
+  server?: EvidenceSourceServer;
+  tool?: string;
+  endpoint?: string;
+  ref?: string;
+  retrieved_at: string;
+  as_of: string;
+  query: string;
+  target?: string;
+  raw_hash: string;
+}
+
+export interface EvidenceQuality {
+  confidence: number;
+  freshness: number;
+  completeness: number;
+  dedupe_key: string;
+  warnings: string[];
+}
+
+export interface QuoteEvidenceValue {
+  schema: "quote.v1";
+  symbol: string;
+  name: string;
+  market: string;
+  price: number;
+  open?: number;
+  high?: number;
+  low?: number;
+  prev_close: number;
+  change_pct: number;
+  volume: number;
+  turnover: number;
+  trade_date: string;
+}
+
+export interface FinancialsEvidenceValue {
+  schema: "financials.v1";
+  symbol: string;
+  name: string;
+  period: string;
+  report_type: string;
+  revenue: number;
+  net_profit: number;
+  gross_margin: number;
+  roe: number;
+  total_assets: number;
+  total_equity?: number;
+  operating_cash_flow: number;
+  currency: string;
+}
+
+export interface AnnouncementEvidenceValue {
+  schema: "announcement.v1";
+  symbol: string;
+  name: string;
+  title: string;
+  published_at: string;
+  category: string;
+  source_url?: string;
+  source_id?: string;
+  summary: string;
+}
+
+export interface NewsEvidenceValue {
+  schema: "news.v1";
+  title: string;
+  published_at: string;
+  source: string;
+  related_symbols: string[];
+  summary: string;
+  sentiment?: "positive" | "neutral" | "negative";
+}
+
+export interface ProfileEvidenceValue {
+  schema: "profile.v1";
+  symbol: string;
+  name: string;
+  market: string;
+  industry: string;
+  business_scope: string;
+  as_of: string;
+}
+
+export interface MacroEvidenceValue {
+  schema: "macro.v1";
+  indicator_name: string;
+  region: string;
+  frequency: string;
+  value: number;
+  unit: string;
+  period: string;
+}
+
+export type StructuredEvidenceValue =
+  | QuoteEvidenceValue
+  | FinancialsEvidenceValue
+  | AnnouncementEvidenceValue
+  | NewsEvidenceValue
+  | ProfileEvidenceValue
+  | MacroEvidenceValue
+  | Record<string, unknown>;
+
 export interface ResearchRequest {
   request: string;
   target?: string;
@@ -52,13 +179,17 @@ export type NormalizedResearchRequest = ResearchRequest & {
 };
 
 export interface EvidenceItem {
+  schema_version?: EvidenceSchemaVersion;
   id: string;
+  domain?: EvidenceDomain;
   source_type: EvidenceSourceType;
   source_name: string;
   query: string;
   as_of: string;
   retrieved_at: string;
   confidence: number;
+  source_meta?: EvidenceSourceMeta;
+  quality?: EvidenceQuality;
   value?: unknown;
   raw_text?: string;
   raw_ref?: string;
@@ -69,6 +200,8 @@ export interface DataGap {
   query: string;
   reason: string;
   occurred_at: string;
+  reason_code?: DataGapReasonCode;
+  source_meta?: EvidenceSourceMeta;
 }
 
 export interface Finding {
@@ -165,6 +298,7 @@ export interface SubagentExecutionTrace {
 }
 
 export interface FinalReport {
+  evidence_schema_version: EvidenceSchemaVersion;
   target: string;
   task_type: TaskType;
   selected_agents: SubagentId[];
@@ -181,15 +315,17 @@ export interface FinalReport {
 
 export interface IFindQueryRequest {
   server: "stock" | "fund" | "news" | "edb";
-  intent: "quote" | "profile" | "financials" | "news" | "macro";
+  intent: Exclude<EvidenceIntent, "announcement">;
   query: string;
   target?: string;
 }
 
-export interface IFindQueryResult {
+export interface EvidenceCollectionResult {
   evidence: EvidenceItem[];
   data_gaps: DataGap[];
 }
+
+export type IFindQueryResult = EvidenceCollectionResult;
 
 export interface ResearchDataAdapters {
   queryIFind(request: IFindQueryRequest): Promise<IFindQueryResult>;
@@ -197,7 +333,7 @@ export interface ResearchDataAdapters {
 
 export interface EvidenceProvider {
   name: ResearchSourceName;
-  collect(task: SubagentTask): Promise<IFindQueryResult>;
+  collect(task: SubagentTask): Promise<EvidenceCollectionResult>;
 }
 
 export interface LLMGenerateRequest {
@@ -208,6 +344,7 @@ export interface LLMGenerateRequest {
   skill_text: string;
   delegation_context?: string;
   upstream_results?: Array<Pick<SubagentResult, "agent_id" | "summary" | "findings" | "data_gaps" | "needs_revision">>;
+  signal?: AbortSignal;
 }
 
 export interface LLMAdapter {

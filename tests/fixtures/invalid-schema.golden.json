@@ -1,0 +1,38 @@
+{
+  "input": {
+    "source_type": "ifind_mcp",
+    "vendor": "ifind",
+    "server": "stock",
+    "source_name": "hexin-ifind-ds-stock-mcp",
+    "query": "CATL quote",
+    "target": "CATL",
+    "intent": "quote",
+    "tool": "stock_quote",
+    "retrieved_at": "2026-06-10T00:00:00.000Z",
+    "raw": {
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "price": 245.6
+    }
+  },
+  "expected": {
+    "evidence_count": 1,
+    "data_gap_count": 1,
+    "domain": "quote",
+    "value": {
+      "schema": "quote.v1",
+      "symbol": "300750.SZ",
+      "name": "CATL",
+      "market": "",
+      "price": 245.6,
+      "prev_close": "__NaN__",
+      "change_pct": "__NaN__",
+      "volume": "__NaN__",
+      "turnover": "__NaN__",
+      "trade_date": "2026-06-10"
+    },
+    "reason_code": "schema_invalid",
+    "warning": "missing:market",
+    "max_confidence": 0.6
+  }
+}

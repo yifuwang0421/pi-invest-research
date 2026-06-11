@@ -1,7 +1,7 @@
 import { createHeuristicLLMAdapter, createOpenAICompatibleLLMAdapter } from "./llm.js";
 import type { OpenAICompatibleLLMOptions } from "./llm.js";
 import { buildFinalReport } from "./report.js";
-import { reviewSubagentResult } from "./review.js";
+import { reviewSubagentResults } from "./review.js";
 import type {
   DelegationPolicy,
   EvidenceProvider,
@@ -27,14 +27,16 @@ import { normalizeResearchRequest } from "./target-parser.js";
 
 const FULL_RESEARCH_AGENTS: SubagentId[] = ["research_evidence", "thesis_valuation", "risk_report"];
 const EVIDENCE_AND_RISK_AGENTS: SubagentId[] = ["research_evidence", "risk_report"];
-const EVIDENCE_ONLY_AGENTS: SubagentId[] = ["research_evidence"];
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3;
 const DEFAULT_MAX_SPAWN_DEPTH = 1;
+const DEFAULT_LLM_TIMEOUT_MS = 120_000;
 
 export interface OrchestratorOptions {
   adapters?: ResearchDataAdapters;
   evidenceProviders?: EvidenceProvider[];
   llmAdapter?: LLMAdapter;
+  llmTimeoutMs?: number;
+  signal?: AbortSignal;
   skillTextByAgent?: Partial<Record<SubagentId, string>>;
   delegation?: Partial<Pick<DelegationPolicy, "max_concurrency" | "max_spawn_depth" | "allow_nested_orchestrators">>;
 }
@@ -57,9 +59,11 @@ export async function investResearch(
     plan.normalized_request,
     options.skillTextByAgent ?? {},
     options.delegation?.max_concurrency ?? plan.delegation_policy.max_concurrency,
+    options.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
+    options.signal,
   );
 
-  const reviews = delegated.results.map(reviewSubagentResult);
+  const reviews = reviewSubagentResults(delegated.results);
   const revisedResults = delegated.results.map((result, index) => {
     const review = reviews[index];
     if (!review || review.pass) return result;
@@ -70,7 +74,7 @@ export async function investResearch(
     };
   });
 
-  return buildFinalReport(plan, revisedResults, revisedResults.map(reviewSubagentResult), delegated.executions);
+  return buildFinalReport(plan, revisedResults, reviewSubagentResults(revisedResults), delegated.executions);
 }
 
 export function buildResearchPlan(input: ResearchRequest): ResearchPlan {
@@ -100,14 +104,12 @@ export function buildResearchPlan(input: ResearchRequest): ResearchPlan {
 }
 
 export function selectSubagents(taskType: TaskType, request: string): SubagentId[] {
-  const text = request.toLowerCase();
   if (taskType === "technical_review") return EVIDENCE_AND_RISK_AGENTS;
   if (taskType === "risk_review") return EVIDENCE_AND_RISK_AGENTS;
   if (taskType === "valuation") return FULL_RESEARCH_AGENTS;
   if (taskType === "news_event") return FULL_RESEARCH_AGENTS;
   if (taskType === "deep_research") return FULL_RESEARCH_AGENTS;
-  if (text.includes("风险") || text.includes("复盘") || text.includes("技术")) return EVIDENCE_AND_RISK_AGENTS;
-  return EVIDENCE_ONLY_AGENTS;
+  return EVIDENCE_AND_RISK_AGENTS;
 }
 
 export function buildSubagentTask(
@@ -148,6 +150,8 @@ export async function runSubagentTask(
   normalizedRequest: NormalizedResearchRequest,
   skillText: string,
   upstreamResults: SubagentResult[] = [],
+  llmTimeoutMs = DEFAULT_LLM_TIMEOUT_MS,
+  parentSignal?: AbortSignal,
 ): Promise<SubagentResult> {
   let evidenceResult: Awaited<ReturnType<typeof collectEvidenceForTask>>;
   try {
@@ -164,8 +168,9 @@ export async function runSubagentTask(
     ]);
   }
 
+  const timeout = createTimeoutSignal(llmTimeoutMs, parentSignal);
   try {
-    return await llmAdapter.generateSubagentResult({
+    const request = {
       normalized_request: normalizedRequest,
       task,
       evidence: evidenceResult.evidence,
@@ -179,7 +184,13 @@ export async function runSubagentTask(
         data_gaps: result.data_gaps,
         needs_revision: result.needs_revision,
       })),
-    });
+      ...(timeout.signal ? { signal: timeout.signal } : {}),
+    };
+    return await withTimeout(
+      llmAdapter.generateSubagentResult(request),
+      llmTimeoutMs,
+      timeout,
+    );
   } catch (error) {
     const occurredAt = new Date().toISOString();
     return createLLMErrorResult(task, evidenceResult.evidence, [
@@ -191,6 +202,8 @@ export async function runSubagentTask(
         occurred_at: occurredAt,
       },
     ]);
+  } finally {
+    timeout.cleanup();
   }
 }
 
@@ -201,6 +214,8 @@ export async function runDelegatedSubagentBatch(
   normalizedRequest: NormalizedResearchRequest,
   skillTextByAgent: Partial<Record<SubagentId, string>> = {},
   maxConcurrency = DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+  llmTimeoutMs = DEFAULT_LLM_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<{ results: SubagentResult[]; executions: SubagentExecutionTrace[] }> {
   const pending = new Map(tasks.map((task, index) => [task.agent_id, { task, index }]));
   const completed = new Map<SubagentId, SubagentResult>();
@@ -221,6 +236,8 @@ export async function runDelegatedSubagentBatch(
       normalizedRequest,
       skillTextByAgent,
       completed,
+      llmTimeoutMs,
+      signal,
     );
 
     for (const item of stage) {
@@ -325,6 +342,8 @@ async function runReadySubagentStage(
   normalizedRequest: NormalizedResearchRequest,
   skillTextByAgent: Partial<Record<SubagentId, string>>,
   completed: Map<SubagentId, SubagentResult>,
+  llmTimeoutMs: number,
+  signal: AbortSignal | undefined,
 ): Promise<Array<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }>> {
   const output: Array<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }> = [];
   let cursor = 0;
@@ -346,6 +365,8 @@ async function runReadySubagentStage(
           normalizedRequest,
           skillTextByAgent[item.task.agent_id] ?? "",
           upstreamResults,
+          llmTimeoutMs,
+          signal,
         ),
       );
     }
@@ -363,11 +384,22 @@ async function runTracedSubagentTask(
   normalizedRequest: NormalizedResearchRequest,
   skillText: string,
   upstreamResults: SubagentResult[],
+  llmTimeoutMs: number,
+  signal: AbortSignal | undefined,
 ): Promise<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }> {
   const started = new Date();
   const executionIds = buildExecutionIds(task.agent_id, taskIndex);
   try {
-    const result = await runSubagentTask(task, providers, llmAdapter, normalizedRequest, skillText, upstreamResults);
+    const result = await runSubagentTask(
+      task,
+      providers,
+      llmAdapter,
+      normalizedRequest,
+      skillText,
+      upstreamResults,
+      llmTimeoutMs,
+      signal,
+    );
     const completed = new Date();
     return {
       task,
@@ -427,6 +459,56 @@ function buildExecutionIds(agentId: SubagentId, taskIndex: number): Pick<
     terminal_session_id: `term-${ordinal}-${agentId}`,
     workspace_id: `workspace-${ordinal}-${agentId}`,
   };
+}
+
+function createTimeoutSignal(
+  timeoutMs: number,
+  parentSignal?: AbortSignal,
+): { signal?: AbortSignal; cleanup: () => void } {
+  if (timeoutMs <= 0) {
+    return parentSignal ? { signal: parentSignal, cleanup: () => undefined } : { cleanup: () => undefined };
+  }
+
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  const abortFromParent = () => controller.abort(parentSignal?.reason ?? new Error("Parent signal aborted."));
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    timeout = setTimeout(() => {
+      controller.abort(new Error(`LLM subagent timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timeout) clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeout: { signal?: AbortSignal },
+): Promise<T> {
+  if (timeoutMs <= 0 || !timeout.signal) return promise;
+  if (timeout.signal.aborted) throw timeout.signal.reason ?? new Error("LLM subagent aborted.");
+
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      timeout.signal?.addEventListener(
+        "abort",
+        () => reject(timeout.signal?.reason ?? new Error("LLM subagent aborted.")),
+        { once: true },
+      );
+    }),
+  ]);
 }
 
 function createLLMErrorResult(

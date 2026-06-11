@@ -1,10 +1,12 @@
 import { IFindMcpAdapter } from "./ifind-adapter.js";
+import { dedupeEvidence, makeDataGap, normalizeExistingEvidence, normalizeRawEvidence } from "./evidence.js";
 import type {
   DataGap,
+  EvidenceCollectionResult,
+  EvidenceIntent,
   EvidenceItem,
   EvidenceProvider,
   IFindQueryRequest,
-  IFindQueryResult,
   ResearchDataAdapters,
   SubagentId,
   SubagentTask,
@@ -21,11 +23,11 @@ export class IFindEvidenceProvider implements EvidenceProvider {
 
   constructor(private readonly adapter: ResearchDataAdapters = new IFindMcpAdapter()) {}
 
-  async collect(task: SubagentTask): Promise<IFindQueryResult> {
+  async collect(task: SubagentTask): Promise<EvidenceCollectionResult> {
     const requests = buildIFindRequests(task);
     const results = await Promise.all(requests.map((request) => this.adapter.queryIFind(request)));
     return {
-      evidence: results.flatMap((result) => result.evidence),
+      evidence: dedupeEvidence(results.flatMap((result) => result.evidence)),
       data_gaps: results.flatMap((result) => result.data_gaps),
     };
   }
@@ -40,38 +42,30 @@ export class FixtureEvidenceProvider implements EvidenceProvider {
     private readonly clock: () => Date = () => new Date(),
   ) {}
 
-  async collect(task: SubagentTask): Promise<IFindQueryResult> {
+  async collect(task: SubagentTask): Promise<EvidenceCollectionResult> {
     if (this.evidence.length > 0 || this.dataGaps.length > 0) {
+      const evidence = this.evidence.map((item) => ({
+        ...item,
+        id: item.id.endsWith(`-${task.agent_id}`) ? item.id : `${item.id}-${task.agent_id}`,
+        query: item.query || task.task,
+      }));
       return {
-        evidence: this.evidence.map((item) => ({
-          ...item,
-          id: item.id.includes(task.agent_id) ? item.id : `${item.id}-${task.agent_id}`,
-          query: item.query || task.task,
-        })),
+        evidence: normalizeExistingEvidence(evidence),
         data_gaps: this.dataGaps,
       };
     }
 
     const retrievedAt = this.clock().toISOString();
-    return {
-      evidence: [
-        {
-          id: `fixture-${task.agent_id}-${safeId(task.target)}`,
-          source_type: "mock",
-          source_name: "fixture-source",
-          query: task.task,
-          as_of: retrievedAt.slice(0, 10),
-          retrieved_at: retrievedAt,
-          confidence: 0.72,
-          value: {
-            target: task.target,
-            agent_id: task.agent_id,
-            note: "离线 fixture 证据，用于 CLI 验收和无凭证环境。",
-          },
-        },
-      ],
-      data_gaps: [],
-    };
+    return normalizeRawEvidence({
+      source_type: "mock",
+      vendor: "fixture",
+      source_name: "fixture-source",
+      query: task.task,
+      target: task.target,
+      intent: intentForTask(task),
+      retrieved_at: retrievedAt,
+      raw: buildFixturePayload(task, retrievedAt),
+    });
   }
 }
 
@@ -90,25 +84,26 @@ export function createEvidenceProviders(
 export async function collectEvidenceForTask(
   task: SubagentTask,
   providers: EvidenceProvider[],
-): Promise<IFindQueryResult> {
+): Promise<EvidenceCollectionResult> {
   if (providers.length === 0) {
     const occurredAt = new Date().toISOString();
     return {
       evidence: [],
       data_gaps: [
-        {
+        makeDataGap({
           source_name: "source-provider",
           query: task.task,
-          reason: "未启用任何证据源。",
+          reason: "No evidence provider is enabled.",
+          reason_code: "source_unavailable",
           occurred_at: occurredAt,
-        },
+        }),
       ],
     };
   }
 
   const results = await Promise.all(providers.map((provider) => provider.collect(task)));
   return {
-    evidence: results.flatMap((result) => result.evidence),
+    evidence: dedupeEvidence(results.flatMap((result) => result.evidence)),
     data_gaps: results.flatMap((result) => result.data_gaps),
   };
 }
@@ -147,6 +142,51 @@ export function requiredEvidenceFor(agent_id: SubagentId): string[] {
   }
 }
 
-function safeId(value: string): string {
-  return value.replace(/[^\p{Letter}\p{Number}]+/gu, "-").replace(/^-|-$/g, "").slice(0, 32).toLowerCase() || "target";
+function intentForTask(task: SubagentTask): EvidenceIntent {
+  if (task.agent_id === "thesis_valuation") return "financials";
+  if (task.agent_id === "risk_report") return "news";
+  return "quote";
+}
+
+function buildFixturePayload(task: SubagentTask, retrievedAt: string): unknown {
+  if (task.agent_id === "thesis_valuation") {
+    return {
+      symbol: task.target,
+      name: task.target,
+      period: "2026Q1",
+      report_type: "quarterly",
+      revenue: 79700000000,
+      net_profit: 10500000000,
+      gross_margin: 24.5,
+      roe: 6.7,
+      total_assets: 765000000000,
+      total_equity: 285000000000,
+      operating_cash_flow: 13200000000,
+      currency: "CNY",
+    };
+  }
+  if (task.agent_id === "risk_report") {
+    return {
+      title: `${task.target} risk update`,
+      published_at: retrievedAt,
+      source: "fixture-source",
+      related_symbols: [task.target],
+      summary: "Offline risk evidence for deterministic validation.",
+      sentiment: "neutral",
+    };
+  }
+  return {
+    symbol: task.target,
+    name: task.target,
+    market: "A-share",
+    price: 245.6,
+    open: 242.1,
+    high: 248.2,
+    low: 240.3,
+    prev_close: 241.26,
+    change_pct: 1.8,
+    volume: 12345678,
+    turnover: 3012345678,
+    trade_date: retrievedAt.slice(0, 10),
+  };
 }
