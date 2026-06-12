@@ -45,6 +45,51 @@ export function buildMarkdownReport(
     lines.push(`- **${SUBAGENT_PROFILES[result.agent_id].name}**：${result.summary}`);
   }
 
+  lines.push("", "## Structured Agent Outputs", "");
+  for (const result of subagentResults) {
+    const output = result.structured_output;
+    if (!output) continue;
+    if (output.agent_id === "research_evidence") {
+      lines.push(`### ${SUBAGENT_PROFILES[result.agent_id].name} - Fact Table`, "");
+      for (const fact of output.fact_table) {
+        const suffix = fact.evidence_ids.length > 0 ? ` (evidence: ${fact.evidence_ids.join(", ")})` : " (assumption)";
+        lines.push(`- [${fact.domain}] ${fact.fact}${suffix}`);
+      }
+      if (output.data_gaps.length > 0) {
+        lines.push("", "Data gaps:");
+        for (const gap of output.data_gaps) lines.push(`- ${gap.topic}: ${gap.reason}`);
+      }
+      lines.push("");
+    }
+
+    if (output.agent_id === "thesis_valuation") {
+      lines.push(`### ${SUBAGENT_PROFILES[result.agent_id].name} - Thesis And Valuation`, "");
+      for (const thesis of output.theses) {
+        lines.push(`- [${thesis.direction}] ${thesis.statement} (evidence: ${thesis.evidence_ids.join(", ") || "none"})`);
+      }
+      lines.push(
+        `- Valuation framework: ${output.valuation_framework.method}; ${output.valuation_framework.valuation_view}`,
+      );
+      for (const variable of output.scenario_variables) {
+        lines.push(`- Scenario variable: ${variable.name} | base=${variable.base} | bull=${variable.bull} | bear=${variable.bear}`);
+      }
+      lines.push("");
+    }
+
+    if (output.agent_id === "risk_report") {
+      lines.push(`### ${SUBAGENT_PROFILES[result.agent_id].name} - Risk And Counter Evidence`, "");
+      lines.push(`- Final stance: ${output.final_summary.stance}`);
+      for (const item of output.counter_evidence) {
+        lines.push(`- Counter-evidence [${item.severity}]: ${item.claim_challenged} -> ${item.counterpoint}`);
+      }
+      for (const trigger of output.risk_triggers) {
+        const threshold = trigger.threshold ? `; threshold=${trigger.threshold}` : "";
+        lines.push(`- Trigger: ${trigger.trigger}; metric/event=${trigger.metric_or_event}${threshold}`);
+      }
+      lines.push("");
+    }
+  }
+
   lines.push("", "## 证据表", "");
   if (evidence.length === 0) {
     lines.push("- 暂无可用证据。");
@@ -141,6 +186,41 @@ function canonicalizeSubagentEvidence(results: SubagentResult[]): SubagentResult
         ...finding,
         evidence_ids: [...new Set(finding.evidence_ids.map((id) => canonicalIdByOriginalId.get(id) ?? id))],
       })),
+      ...(result.structured_output
+        ? { structured_output: canonicalizeStructuredOutputEvidenceIds(result.structured_output, canonicalIdByOriginalId) }
+        : {}),
     };
   });
+}
+
+function canonicalizeStructuredOutputEvidenceIds(
+  output: NonNullable<SubagentResult["structured_output"]>,
+  canonicalIdByOriginalId: Map<string, string>,
+): NonNullable<SubagentResult["structured_output"]> {
+  const mapIds = (ids: string[]) => [...new Set(ids.map((id) => canonicalIdByOriginalId.get(id) ?? id))];
+  if (output.agent_id === "research_evidence") {
+    return {
+      ...output,
+      fact_table: output.fact_table.map((fact) => ({ ...fact, evidence_ids: mapIds(fact.evidence_ids) })),
+    };
+  }
+  if (output.agent_id === "thesis_valuation") {
+    return {
+      ...output,
+      theses: output.theses.map((thesis) => ({ ...thesis, evidence_ids: mapIds(thesis.evidence_ids) })),
+      valuation_framework: {
+        ...output.valuation_framework,
+        evidence_ids: mapIds(output.valuation_framework.evidence_ids),
+      },
+      scenario_variables: output.scenario_variables.map((variable) => ({
+        ...variable,
+        evidence_ids: mapIds(variable.evidence_ids),
+      })),
+    };
+  }
+  return {
+    ...output,
+    counter_evidence: output.counter_evidence.map((item) => ({ ...item, evidence_ids: mapIds(item.evidence_ids) })),
+    risk_triggers: output.risk_triggers.map((trigger) => ({ ...trigger, evidence_ids: mapIds(trigger.evidence_ids) })),
+  };
 }

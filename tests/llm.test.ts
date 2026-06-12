@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createOpenAICompatibleLLMAdapter } from "../src/llm.js";
-import type { LLMGenerateRequest } from "../src/schemas.js";
+import { SUBAGENT_OUTPUT_CONTRACTS } from "../src/output-contracts.js";
+import type { LLMGenerateRequest, SubagentStructuredOutput } from "../src/schemas.js";
 
 test("OpenAI-compatible LLM adapter sends chat completion request and parses JSON", async () => {
   const calls: string[] = [];
@@ -20,6 +21,7 @@ test("OpenAI-compatible LLM adapter sends chat completion request and parses JSO
               assumptions: [],
               open_questions: [],
               confidence: 0.7,
+              structured_output: validThesisStructuredOutput(),
               needs_revision: false,
             }),
           },
@@ -43,11 +45,14 @@ test("OpenAI-compatible LLM adapter sends chat completion request and parses JSO
 
 test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
   let callCount = 0;
-  const fetchImpl: typeof fetch = async () => {
+  const repairPrompts: string[] = [];
+  const fetchImpl: typeof fetch = async (_input, init) => {
     callCount += 1;
     if (callCount === 1) {
       return jsonResponse({ choices: [{ message: { content: "not json" } }] });
     }
+    const body = JSON.parse(String(init?.body)) as { messages: Array<{ content?: string }> };
+    repairPrompts.push(body.messages.at(-1)?.content ?? "");
     return jsonResponse({
       choices: [
         {
@@ -58,6 +63,7 @@ test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
               assumptions: [],
               open_questions: [],
               confidence: 0.6,
+              structured_output: validThesisStructuredOutput(),
               needs_revision: false,
             }),
           },
@@ -78,6 +84,7 @@ test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
 
   assert.equal(callCount, 2);
   assert.equal(result.summary, "修复后的结构化结果。");
+  assert.match(repairPrompts.join("\n"), /structured_output/);
 });
 
 test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async () => {
@@ -102,6 +109,7 @@ test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async (
               assumptions: [],
               open_questions: [],
               confidence: 0.6,
+              structured_output: validThesisStructuredOutput(),
               needs_revision: false,
             }),
           },
@@ -181,7 +189,7 @@ function makeLLMRequest(): LLMGenerateRequest {
       required_evidence: ["财务摘要"],
       allowed_skills: ["thesis-valuation"],
       allowed_toolsets: ["evidence", "llm"],
-      result_contract: ["核心 thesis"],
+      result_contract: SUBAGENT_OUTPUT_CONTRACTS.thesis_valuation,
       delegation_context: "独立上下文任务。",
       isolation: {
         fresh_context: true,
@@ -206,6 +214,36 @@ function makeLLMRequest(): LLMGenerateRequest {
     ],
     data_gaps: [],
     skill_text: "# Thesis Valuation",
+  };
+}
+
+function validThesisStructuredOutput(): SubagentStructuredOutput {
+  return {
+    schema_version: "subagent-output.v1",
+    agent_id: "thesis_valuation",
+    theses: [
+      {
+        statement: "Evidence supports a preliminary mixed thesis.",
+        direction: "mixed",
+        evidence_ids: ["ev-1"],
+        confidence: 0.6,
+      },
+    ],
+    valuation_framework: {
+      method: "scenario framework",
+      key_assumptions: ["Fixture evidence is sufficient for parser validation."],
+      valuation_view: "fairly_valued",
+      evidence_ids: ["ev-1"],
+    },
+    scenario_variables: [
+      {
+        name: "margin",
+        base: "stable",
+        bull: "improves",
+        bear: "compresses",
+        evidence_ids: ["ev-1"],
+      },
+    ],
   };
 }
 

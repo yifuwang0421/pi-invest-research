@@ -30,6 +30,20 @@ test("investResearch produces a Markdown report with the compressed three-agent 
     report.trace.delegation_executions.find((entry) => entry.agent_id === "risk_report")?.upstream_agents,
     ["research_evidence", "thesis_valuation"],
   );
+  assert.deepEqual(
+    report.trace.subagent_results.map((result) => result.structured_output?.agent_id),
+    report.trace.subagent_results.map((result) => result.agent_id),
+  );
+  assert.match(report.markdown, /## Structured Agent Outputs/);
+  assert.match(report.markdown, /Fact Table/);
+  assert.match(report.markdown, /\[(quote|financials|announcement|news|profile|macro|other)\]/);
+  assert.match(report.markdown, /Thesis And Valuation/);
+  assert.match(report.markdown, /\[(bullish|neutral|bearish|mixed)\]/);
+  assert.match(report.markdown, /Valuation framework: evidence-led qualitative framework; (fairly_valued|insufficient_data)/);
+  assert.match(report.markdown, /Scenario variable: evidence quality/);
+  assert.match(report.markdown, /Risk And Counter Evidence/);
+  assert.match(report.markdown, /Counter-evidence \[(low|medium|high)\]/);
+  assert.match(report.markdown, /Trigger: Evidence quality deteriorates or key data remains unavailable/);
   assert.match(
     report.trace.delegation_executions[0]?.terminal_session_id ?? "",
     /^term-\d+-/,

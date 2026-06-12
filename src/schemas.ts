@@ -43,6 +43,8 @@ export type EvidenceIntent = EvidenceDomain;
 
 export type EvidenceSchemaVersion = "evidence.v1";
 
+export type SubagentOutputSchemaVersion = "subagent-output.v1";
+
 export type DataGapReasonCode =
   | "transport_error"
   | "tool_missing"
@@ -211,17 +213,138 @@ export interface Finding {
   is_assumption?: boolean;
 }
 
-export interface SubagentProfile {
-  id: SubagentId;
+export interface SubagentOutputContract<TAgent extends SubagentId = SubagentId> {
+  schema_version: SubagentOutputSchemaVersion;
+  agent_id: TAgent;
+  description: string;
+  required_fields: string[];
+  optional_fields?: string[];
+  example_shape: SubagentStructuredOutputByAgent[TAgent];
+}
+
+export interface ResearchEvidenceFact {
+  fact: string;
+  domain: EvidenceDomain | "other";
+  evidence_ids: string[];
+  confidence: number;
+  as_of: string;
+  is_assumption?: boolean;
+}
+
+export interface ResearchEvidenceDataGap {
+  topic: string;
+  reason: string;
+  needed_evidence?: string;
+  impact?: string;
+}
+
+export interface EvidenceCoverage {
+  covered_domains: string[];
+  missing_domains: string[];
+  notes: string;
+}
+
+export interface ResearchEvidenceStructuredOutput {
+  schema_version: SubagentOutputSchemaVersion;
+  agent_id: "research_evidence";
+  fact_table: ResearchEvidenceFact[];
+  data_gaps: ResearchEvidenceDataGap[];
+  evidence_coverage: EvidenceCoverage;
+}
+
+export type ThesisDirection = "bullish" | "neutral" | "bearish" | "mixed";
+export type ValuationView = "overvalued" | "fairly_valued" | "undervalued" | "insufficient_data";
+
+export interface ThesisItem {
+  statement: string;
+  direction: ThesisDirection;
+  evidence_ids: string[];
+  confidence: number;
+}
+
+export interface ValuationFramework {
+  method: string;
+  key_assumptions: string[];
+  valuation_view: ValuationView;
+  evidence_ids: string[];
+}
+
+export interface ScenarioVariable {
+  name: string;
+  base: string;
+  bull: string;
+  bear: string;
+  unit?: string;
+  evidence_ids: string[];
+}
+
+export interface ThesisValuationStructuredOutput {
+  schema_version: SubagentOutputSchemaVersion;
+  agent_id: "thesis_valuation";
+  theses: ThesisItem[];
+  valuation_framework: ValuationFramework;
+  scenario_variables: ScenarioVariable[];
+}
+
+export type RiskSeverity = "low" | "medium" | "high";
+export type RiskStance = "positive" | "neutral" | "negative" | "mixed" | "insufficient_data";
+
+export interface CounterEvidenceItem {
+  claim_challenged: string;
+  counterpoint: string;
+  evidence_ids: string[];
+  severity: RiskSeverity;
+}
+
+export interface RiskTrigger {
+  trigger: string;
+  metric_or_event: string;
+  threshold?: string;
+  watch_frequency?: string;
+  derived_from_counter_evidence_index?: number;
+  evidence_ids: string[];
+}
+
+export interface RiskUpstreamReferences {
+  research_evidence_fact_indices: number[];
+  thesis_indices: number[];
+}
+
+export interface RiskFinalSummary {
+  stance: RiskStance;
+  key_reasons: string[];
+  major_risks: string[];
+  data_gaps: string[];
+  upstream_references: RiskUpstreamReferences;
+}
+
+export interface RiskReportStructuredOutput {
+  schema_version: SubagentOutputSchemaVersion;
+  agent_id: "risk_report";
+  counter_evidence: CounterEvidenceItem[];
+  risk_triggers: RiskTrigger[];
+  final_summary: RiskFinalSummary;
+}
+
+export interface SubagentStructuredOutputByAgent {
+  research_evidence: ResearchEvidenceStructuredOutput;
+  thesis_valuation: ThesisValuationStructuredOutput;
+  risk_report: RiskReportStructuredOutput;
+}
+
+export type SubagentStructuredOutput = SubagentStructuredOutputByAgent[SubagentId];
+
+export interface SubagentProfile<TAgent extends SubagentId = SubagentId> {
+  id: TAgent;
   name: string;
   role: string;
   skills: string[];
   boundaries: string[];
-  output_contract: string[];
+  output_contract: SubagentOutputContract<TAgent>;
 }
 
-export interface SubagentTask {
-  agent_id: SubagentId;
+export interface SubagentTask<TAgent extends SubagentId = SubagentId> {
+  agent_id: TAgent;
   task: string;
   target: string;
   task_type: TaskType;
@@ -230,7 +353,7 @@ export interface SubagentTask {
   required_evidence: string[];
   allowed_skills: string[];
   allowed_toolsets: string[];
-  result_contract: string[];
+  result_contract: SubagentOutputContract<TAgent>;
   delegation_context: string;
   isolation: {
     fresh_context: true;
@@ -252,6 +375,7 @@ export interface SubagentResult {
   open_questions: string[];
   confidence: number;
   data_gaps: DataGap[];
+  structured_output?: SubagentStructuredOutput;
   needs_revision: boolean;
 }
 
@@ -343,7 +467,7 @@ export interface LLMGenerateRequest {
   data_gaps: DataGap[];
   skill_text: string;
   delegation_context?: string;
-  upstream_results?: Array<Pick<SubagentResult, "agent_id" | "summary" | "findings" | "data_gaps" | "needs_revision">>;
+  upstream_results?: Array<Pick<SubagentResult, "agent_id" | "summary" | "findings" | "data_gaps" | "structured_output" | "needs_revision">>;
   signal?: AbortSignal;
 }
 

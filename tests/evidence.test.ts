@@ -273,6 +273,42 @@ test("profile and macro domains use explicit minimal schemas", () => {
   assert.equal(macro.evidence[0]?.quality?.completeness, 1);
 });
 
+test("profile and macro missing fields emit schema warnings", () => {
+  const profile = normalizeRawEvidence({
+    source_type: "api",
+    vendor: "company-api",
+    source_name: "company-api",
+    query: "CATL partial profile",
+    target: "CATL",
+    intent: "profile",
+    retrieved_at: "2026-06-10T00:00:00.000Z",
+    raw: {
+      symbol: "300750.SZ",
+      name: "CATL",
+    },
+  });
+  const macro = normalizeRawEvidence({
+    source_type: "api",
+    vendor: "macro-api",
+    source_name: "macro-api",
+    query: "China partial macro",
+    intent: "macro",
+    retrieved_at: "2026-06-10T00:00:00.000Z",
+    raw: {
+      indicator_name: "PMI",
+      region: "China",
+      period: "2026-05",
+    },
+  });
+
+  assert.ok(profile.evidence[0]?.quality?.warnings.includes("missing:market"));
+  assert.ok(profile.evidence[0]?.quality?.warnings.includes("missing:industry"));
+  assert.equal(profile.data_gaps.some((gap) => gap.reason_code === "schema_invalid"), true);
+  assert.ok(macro.evidence[0]?.quality?.warnings.includes("missing:frequency"));
+  assert.ok(macro.evidence[0]?.quality?.warnings.includes("missing:value"));
+  assert.equal(macro.data_gaps.some((gap) => gap.reason_code === "schema_invalid"), true);
+});
+
 test("announcement evidence accepts source ids without source URLs", () => {
   const result = normalizeRawEvidence({
     source_type: "api",

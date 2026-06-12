@@ -22,6 +22,7 @@ import {
   createEvidenceProviders,
   requiredEvidenceFor,
 } from "./sources.js";
+import { createFallbackStructuredOutput, describeOutputContract } from "./output-contracts.js";
 import { SUBAGENT_PROFILES } from "./subagents.js";
 import { normalizeResearchRequest } from "./target-parser.js";
 
@@ -182,6 +183,7 @@ export async function runSubagentTask(
         summary: result.summary,
         findings: result.findings,
         data_gaps: result.data_gaps,
+        ...(result.structured_output ? { structured_output: result.structured_output } : {}),
         needs_revision: result.needs_revision,
       })),
       ...(timeout.signal ? { signal: timeout.signal } : {}),
@@ -300,7 +302,7 @@ function buildStaticDelegationContext(
     "你是被父级投研 agent 委托的隔离子 agent。",
     `父任务：${target} / ${taskType}。`,
     `你的边界：${profile.boundaries.join("；")}。`,
-    `返回契约：${profile.output_contract.join("；")}。`,
+    `返回契约：${describeOutputContract(profile.output_contract)}。`,
     dependencyLine,
     "你拥有独立上下文、独立终端会话和独立工作区标识；不能读取父会话历史，不能向用户追问，不能写共享记忆，不能产生外部副作用。",
     "只返回结构化摘要和可验证 evidence_ids；父 agent 负责最终合成与复核。",
@@ -535,6 +537,12 @@ function createLLMErrorResult(
     open_questions: ["LLM 调用失败或输出结构无效，需要重新运行。"],
     confidence: 0.25,
     data_gaps: dataGaps,
+    structured_output: createFallbackStructuredOutput({
+      agent_id: task.agent_id,
+      target: task.target,
+      evidence,
+      data_gaps: dataGaps,
+    }),
     needs_revision: true,
   };
 }

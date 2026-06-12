@@ -3,8 +3,14 @@ import type {
   LLMAdapter,
   LLMGenerateRequest,
   SubagentResult,
+  SubagentStructuredOutput,
 } from "./schemas.js";
 import { summarizeEvidenceForLLM } from "./evidence.js";
+import {
+  createFallbackStructuredOutput,
+  getRequiredStructuredShape,
+  parseStructuredOutput,
+} from "./output-contracts.js";
 import { SUBAGENT_PROFILES } from "./subagents.js";
 
 interface ChatMessage {
@@ -19,6 +25,20 @@ interface ChatCompletionResponse {
     };
   }>;
 }
+
+type LLMRequiredShape = Omit<SubagentResult, "evidence" | "data_gaps" | "structured_output"> & {
+  structured_output: SubagentStructuredOutput;
+};
+
+const REQUIRED_RESULT_SHAPE_TEMPLATE = {
+  task: "string",
+  summary: "string",
+  findings: [{ statement: "string", evidence_ids: ["string"], confidence: 0.0 }],
+  assumptions: ["string"],
+  open_questions: ["string"],
+  confidence: 0.0,
+  needs_revision: false,
+} satisfies Omit<LLMRequiredShape, "agent_id" | "structured_output">;
 
 export interface OpenAICompatibleLLMOptions {
   apiKey?: string;
@@ -76,7 +96,12 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
         ...messages,
         {
           role: "user",
-          content: `上一次输出无法解析为有效 JSON。请只返回一个 JSON 对象，不要 Markdown，不要代码围栏。错误：${firstError instanceof Error ? firstError.message : String(firstError)}`,
+          content: [
+            "The previous output did not satisfy the required JSON contract.",
+            "Return only one JSON object. Do not use Markdown or code fences.",
+            "The object must include structured_output exactly matching required_shape.structured_output.",
+            `Error: ${firstError instanceof Error ? firstError.message : String(firstError)}`,
+          ].join("\n"),
         },
       ];
       try {
@@ -215,14 +240,9 @@ function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
           upstream_results: request.upstream_results ?? [],
           required_shape: {
             agent_id: request.task.agent_id,
-            task: "string",
-            summary: "string",
-            findings: [{ statement: "string", evidence_ids: ["string"], confidence: 0.0, is_assumption: false }],
-            assumptions: ["string"],
-            open_questions: ["string"],
-            confidence: 0.0,
-            needs_revision: false,
-          },
+            ...REQUIRED_RESULT_SHAPE_TEMPLATE,
+            structured_output: getRequiredStructuredShape(request.task.agent_id),
+          } satisfies LLMRequiredShape,
         },
         null,
         2,
@@ -244,6 +264,7 @@ function parseAndNormalize(content: string, request: LLMGenerateRequest): Subage
         ...(finding.is_assumption ? { is_assumption: true } : {}),
       })).filter((finding) => finding.statement.trim().length > 0)
     : [];
+  const structuredOutput = parseStructuredOutput(request.task.agent_id, parsed.structured_output);
 
   return {
     agent_id: request.task.agent_id,
@@ -257,6 +278,7 @@ function parseAndNormalize(content: string, request: LLMGenerateRequest): Subage
     open_questions: normalizeStringArray(parsed.open_questions),
     confidence: clampConfidence(parsed.confidence),
     data_gaps: request.data_gaps,
+    structured_output: structuredOutput,
     needs_revision: Boolean(parsed.needs_revision) || findings.length === 0,
   };
 }
@@ -286,6 +308,12 @@ function buildHeuristicResult(request: LLMGenerateRequest): SubagentResult {
     open_questions: [],
     confidence: hasEvidence ? 0.68 : 0.3,
     data_gaps: request.data_gaps,
+    structured_output: createFallbackStructuredOutput({
+      agent_id: request.task.agent_id,
+      target: request.task.target,
+      evidence: request.evidence,
+      data_gaps: request.data_gaps,
+    }),
     needs_revision: !hasEvidence && request.task.required_evidence.length > 0,
   };
 }

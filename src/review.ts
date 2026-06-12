@@ -1,4 +1,5 @@
-import type { EvidenceItem, ReviewResult, SubagentId, SubagentResult } from "./schemas.js";
+import type { EvidenceDomain, EvidenceItem, ReviewResult, SubagentId, SubagentResult } from "./schemas.js";
+import { validateStructuredOutput } from "./output-contracts.js";
 
 type Severity = "critical" | "major" | "minor";
 
@@ -7,85 +8,18 @@ interface ReviewIssue {
   message: string;
 }
 
-interface ContractRequirement {
-  label: string;
-  terms: string[];
-}
-
 const SEVERITY_PENALTY: Record<Severity, number> = {
   critical: 30,
   major: 15,
   minor: 6,
 };
-
-const CONTRACT_REQUIREMENTS: Record<SubagentId, ContractRequirement[]> = {
-  research_evidence: [
-    { label: "evidence summary", terms: ["evidence", "source", "证据"] },
-    { label: "facts or observations", terms: ["fact", "observation", "事实", "观察"] },
-    { label: "data gaps", terms: ["gap", "missing", "数据缺口", "缺口"] },
-  ],
-  thesis_valuation: [
-    { label: "investment thesis", terms: ["thesis", "view", "观点", "投资"] },
-    { label: "earnings or valuation assumptions", terms: ["valuation", "earnings", "assumption", "估值", "盈利", "假设"] },
-    { label: "scenario or sensitivity", terms: ["scenario", "sensitivity", "情景", "敏感"] },
-  ],
-  risk_report: [
-    { label: "core risks", terms: ["risk", "风险"] },
-    { label: "counter-evidence checks", terms: ["counter", "disconfirm", "反证"] },
-    { label: "risk triggers", terms: ["trigger", "触发"] },
-    { label: "final report summary", terms: ["report", "summary", "报告", "摘要"] },
-  ],
+const OTHER_DOMAIN_WARNING_RATIO = 0.5;
+const STRUCTURED_CONFIDENCE_MIN = 0.35;
+const AGENT_EVIDENCE_DOMAINS: Record<SubagentId, EvidenceDomain[]> = {
+  research_evidence: ["quote", "financials", "announcement", "news", "profile", "macro"],
+  thesis_valuation: ["quote", "financials", "profile", "macro"],
+  risk_report: ["quote", "financials", "announcement", "news"],
 };
-
-const GENERIC_TERMS = new Set([
-  "agent",
-  "analysis",
-  "available",
-  "claim",
-  "complete",
-  "conclusion",
-  "data",
-  "evidence",
-  "finding",
-  "report",
-  "review",
-  "summary",
-  "公司",
-  "分析",
-  "研究",
-  "证据",
-  "可用",
-  "引用",
-  "进入",
-  "汇总",
-  "评审",
-]);
-
-const POSITIVE_THESIS_TERMS = [
-  "buy",
-  "bull",
-  "positive",
-  "upside",
-  "undervalued",
-  "乐观",
-  "低估",
-  "上行",
-  "买入",
-  "改善",
-];
-
-const HIGH_RISK_TERMS = [
-  "avoid",
-  "bear",
-  "downside",
-  "high risk",
-  "negative",
-  "高风险",
-  "重大风险",
-  "下行",
-  "回避",
-  "负面",
-];
 
 export function reviewSubagentResult(result: SubagentResult): ReviewResult {
   return buildReviewResult(result, collectSingleResultIssues(result));
@@ -128,16 +62,10 @@ function collectSingleResultIssues(result: SubagentResult): ReviewIssue[] {
     if (missingIds.length > 0) {
       issues.push({ severity: "critical", message: `Finding cites missing evidence: ${missingIds.join(", ")}` });
     }
-    if (!finding.is_assumption && citedEvidence.length > 0 && !hasEvidenceClaimRelevance(finding.statement, citedEvidence)) {
+    if (!finding.is_assumption && citedEvidence.length > 0 && !hasAgentDomainEvidence(result.agent_id, citedEvidence)) {
       issues.push({
         severity: "major",
-        message: `Finding is weakly related to cited evidence: ${finding.statement}`,
-      });
-    }
-    if (!finding.is_assumption && finding.confidence >= 0.65 && citedEvidence.length > 0 && !hasHighQualityEvidence(citedEvidence)) {
-      issues.push({
-        severity: "major",
-        message: `High-confidence finding relies on low-quality evidence: ${finding.statement}`,
+        message: `Finding cites evidence outside ${result.agent_id} domain expectations: ${finding.statement}`,
       });
     }
   }
@@ -149,9 +77,6 @@ function collectSingleResultIssues(result: SubagentResult): ReviewIssue[] {
     if (evidence.confidence < 0 || evidence.confidence > 1) {
       issues.push({ severity: "major", message: `Evidence confidence is outside 0-1: ${evidence.id}` });
     }
-    if (evidence.quality?.warnings.some((warning) => warning.startsWith("missing:")) && evidence.quality.completeness < 0.6) {
-      issues.push({ severity: "major", message: `Evidence schema quality is too low: ${evidence.id}` });
-    }
   }
 
   issues.push(...checkOutputContract(result));
@@ -162,33 +87,248 @@ function collectSingleResultIssues(result: SubagentResult): ReviewIssue[] {
 }
 
 function checkOutputContract(result: SubagentResult): ReviewIssue[] {
-  const text = [
-    result.summary,
-    ...result.findings.map((finding) => finding.statement),
-    ...result.assumptions,
-    ...result.open_questions,
-  ].join("\n").toLowerCase();
+  const issues: ReviewIssue[] = [];
+  const structuredOutput = (result as { structured_output?: unknown }).structured_output;
+  const contractIssues = validateStructuredOutput(result.agent_id, structuredOutput);
+  for (const issue of contractIssues) {
+    issues.push({ severity: "major", message: `Structured output contract invalid: ${issue}.` });
+  }
+  if (contractIssues.length === 0) {
+    issues.push(...checkStructuredEvidenceReferences(result));
+  }
+  return issues;
+}
 
-  return CONTRACT_REQUIREMENTS[result.agent_id]
-    .filter((requirement) => !requirement.terms.some((term) => text.includes(term.toLowerCase())))
-    .map((requirement) => ({
-      severity: "major" as const,
-      message: `Output contract missing ${requirement.label}.`,
-    }));
+function checkStructuredEvidenceReferences(result: SubagentResult): ReviewIssue[] {
+  const issues: ReviewIssue[] = [];
+  const evidenceIds = new Set(result.evidence.map((item) => item.id));
+  const output = result.structured_output;
+  if (!output) return issues;
+
+  if (output.agent_id === "research_evidence") {
+    output.fact_table.forEach((fact, index) => {
+      checkEvidenceIds(`research_evidence.fact_table[${index}].evidence_ids`, fact.evidence_ids, evidenceIds, {
+        allowEmpty: Boolean(fact.is_assumption),
+      }, issues);
+      if (fact.confidence < STRUCTURED_CONFIDENCE_MIN) {
+        issues.push({
+          severity: "major",
+          message: `research_evidence.fact_table[${index}].confidence is below review threshold.`,
+        });
+      }
+    });
+    const factDomains = new Set(output.fact_table.map((fact) => fact.domain).filter((domain) => domain !== "other"));
+    const coveredDomains = new Set(output.evidence_coverage.covered_domains);
+    const missingCoveredDomains = [...factDomains].filter((domain) => !coveredDomains.has(domain));
+    if (missingCoveredDomains.length > 0) {
+      issues.push({
+        severity: "minor",
+        message: `Research evidence coverage omits fact_table domains: ${missingCoveredDomains.join(", ")}.`,
+      });
+    }
+    const otherDomainCount = output.fact_table.filter((fact) => fact.domain === "other").length;
+    if (output.fact_table.length > 0 && otherDomainCount / output.fact_table.length > OTHER_DOMAIN_WARNING_RATIO) {
+      issues.push({
+        severity: "minor",
+        message: "Research evidence overuses domain=other; classify facts into specific evidence domains when possible.",
+      });
+    }
+    if (output.data_gaps.length > 0 && output.data_gaps.every((gap) => !hasText(gap.impact))) {
+      issues.push({
+        severity: "minor",
+        message: "Research evidence data gaps do not include impact assessments.",
+      });
+    }
+    return issues;
+  }
+
+  if (output.agent_id === "thesis_valuation") {
+    output.theses.forEach((thesis, index) => {
+      checkEvidenceIds(`thesis_valuation.theses[${index}].evidence_ids`, thesis.evidence_ids, evidenceIds, {}, issues);
+      if (thesis.confidence < STRUCTURED_CONFIDENCE_MIN) {
+        issues.push({
+          severity: "major",
+          message: `thesis_valuation.theses[${index}].confidence is below review threshold.`,
+        });
+      }
+    });
+    checkEvidenceIds(
+      "thesis_valuation.valuation_framework.evidence_ids",
+      output.valuation_framework.evidence_ids,
+      evidenceIds,
+      { allowEmpty: output.valuation_framework.valuation_view === "insufficient_data" },
+      issues,
+    );
+    output.scenario_variables.forEach((variable, index) => {
+      checkEvidenceIds(
+        `thesis_valuation.scenario_variables[${index}].evidence_ids`,
+        variable.evidence_ids,
+        evidenceIds,
+        {},
+        issues,
+      );
+    });
+    const valuationView = output.valuation_framework.valuation_view;
+    if (valuationView === "overvalued" && output.theses.some((thesis) => thesis.direction === "bullish")) {
+      issues.push({
+        severity: "minor",
+        message: "Thesis direction is bullish while valuation_view is overvalued.",
+      });
+    }
+    if (valuationView === "undervalued" && output.theses.some((thesis) => thesis.direction === "bearish")) {
+      issues.push({
+        severity: "minor",
+        message: "Thesis direction is bearish while valuation_view is undervalued.",
+      });
+    }
+    return issues;
+  }
+
+  const allowRiskWithoutEvidence = output.final_summary.stance === "insufficient_data";
+  output.counter_evidence.forEach((item, index) => {
+    checkEvidenceIds(`risk_report.counter_evidence[${index}].evidence_ids`, item.evidence_ids, evidenceIds, {
+      allowEmpty: allowRiskWithoutEvidence,
+    }, issues);
+  });
+  output.risk_triggers.forEach((trigger, index) => {
+    checkEvidenceIds(`risk_report.risk_triggers[${index}].evidence_ids`, trigger.evidence_ids, evidenceIds, {
+      allowEmpty: allowRiskWithoutEvidence,
+    }, issues);
+    if (
+      trigger.derived_from_counter_evidence_index !== undefined &&
+      trigger.derived_from_counter_evidence_index >= output.counter_evidence.length
+    ) {
+      issues.push({
+        severity: "major",
+        message: `risk_report.risk_triggers[${index}].derived_from_counter_evidence_index points outside counter_evidence.`,
+      });
+    }
+  });
+  const upstreamReferences = output.final_summary.upstream_references;
+  const severities = output.counter_evidence.map((item) => item.severity);
+  if (output.final_summary.stance === "negative" && severities.length > 0 && severities.every((severity) => severity === "low")) {
+    issues.push({
+      severity: "minor",
+      message: "Risk final_summary stance is negative while all counter_evidence severity values are low.",
+    });
+  }
+  if (output.final_summary.stance === "positive" && severities.some((severity) => severity === "high")) {
+    issues.push({
+      severity: "minor",
+      message: "Risk final_summary stance is positive despite high-severity counter_evidence.",
+    });
+  }
+  if (
+    upstreamReferences.research_evidence_fact_indices.length === 0 &&
+    upstreamReferences.thesis_indices.length === 0 &&
+    output.final_summary.stance !== "insufficient_data"
+  ) {
+    issues.push({
+      severity: "minor",
+      message: "Risk final_summary does not explicitly reference upstream research_evidence facts or thesis_valuation theses.",
+    });
+  }
+  return issues;
+}
+
+function checkEvidenceIds(
+  path: string,
+  ids: string[],
+  evidenceIds: Set<string>,
+  options: { allowEmpty?: boolean },
+  issues: ReviewIssue[],
+): void {
+  if (ids.length === 0 && !options.allowEmpty) {
+    issues.push({ severity: "critical", message: `${path} must cite at least one evidence id.` });
+    return;
+  }
+  const missingIds = ids.filter((id) => !evidenceIds.has(id));
+  if (missingIds.length > 0) {
+    issues.push({ severity: "critical", message: `${path} cites missing evidence: ${missingIds.join(", ")}.` });
+  }
+}
+
+function hasText(value: string | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasAgentDomainEvidence(agentId: SubagentId, evidence: EvidenceItem[]): boolean {
+  const allowedDomains = new Set(AGENT_EVIDENCE_DOMAINS[agentId]);
+  return evidence.some((item) => item.domain !== undefined && allowedDomains.has(item.domain));
 }
 
 function collectCrossAgentIssues(
   results: SubagentResult[],
 ): Array<{ agentId: SubagentId; issue: ReviewIssue }> {
   const issues: Array<{ agentId: SubagentId; issue: ReviewIssue }> = [];
+  const research = results.find((result) => result.agent_id === "research_evidence");
   const thesis = results.find((result) => result.agent_id === "thesis_valuation");
   const risk = results.find((result) => result.agent_id === "risk_report");
   if (!risk) return issues;
 
-  const riskText = collectResultText(risk);
+  const researchOutput = research?.structured_output;
+  const thesisOutput = thesis?.structured_output;
+  const riskOutput = risk.structured_output;
+  if (riskOutput?.agent_id === "risk_report") {
+    const upstreamReferences = riskOutput.final_summary.upstream_references;
+    if (researchOutput?.agent_id === "research_evidence") {
+      const invalidFactIndices = upstreamReferences.research_evidence_fact_indices.filter(
+        (index) => index < 0 || index >= researchOutput.fact_table.length,
+      );
+      if (invalidFactIndices.length > 0) {
+        issues.push({
+          agentId: "risk_report",
+          issue: {
+            severity: "major",
+            message: `Risk final_summary references missing research_evidence fact indices: ${invalidFactIndices.join(", ")}.`,
+          },
+        });
+      }
+    } else if (upstreamReferences.research_evidence_fact_indices.length > 0) {
+      issues.push({
+        agentId: "risk_report",
+        issue: {
+          severity: "major",
+          message: "Risk final_summary references research_evidence facts but no structured research_evidence output is available.",
+        },
+      });
+    }
+
+    if (thesisOutput?.agent_id === "thesis_valuation") {
+      const invalidThesisIndices = upstreamReferences.thesis_indices.filter(
+        (index) => index < 0 || index >= thesisOutput.theses.length,
+      );
+      if (invalidThesisIndices.length > 0) {
+        issues.push({
+          agentId: "risk_report",
+          issue: {
+            severity: "major",
+            message: `Risk final_summary references missing thesis_valuation thesis indices: ${invalidThesisIndices.join(", ")}.`,
+          },
+        });
+      }
+    } else if (upstreamReferences.thesis_indices.length > 0) {
+      issues.push({
+        agentId: "risk_report",
+        issue: {
+          severity: "major",
+          message: "Risk final_summary references thesis_valuation theses but no structured thesis_valuation output is available.",
+        },
+      });
+    }
+  }
+
   if (thesis) {
-    const thesisText = collectResultText(thesis);
-    if (containsAny(thesisText, POSITIVE_THESIS_TERMS) && containsAny(riskText, HIGH_RISK_TERMS)) {
+    const hasPositiveThesis =
+      thesisOutput?.agent_id === "thesis_valuation"
+        ? thesisOutput.theses.some((item) => item.direction === "bullish")
+        : false;
+    const hasMaterialNegativeRisk =
+      riskOutput?.agent_id === "risk_report"
+        ? riskOutput.final_summary.stance === "negative" ||
+          riskOutput.counter_evidence.some((item) => item.severity === "high")
+        : false;
+    if (hasPositiveThesis && hasMaterialNegativeRisk) {
       issues.push({
         agentId: "risk_report",
         issue: {
@@ -197,7 +337,7 @@ function collectCrossAgentIssues(
         },
       });
     }
-    if (!containsAny(riskText, ["thesis", "valuation", "观点", "估值", "反证"])) {
+    if (riskOutput?.agent_id === "risk_report" && riskOutput.counter_evidence.length === 0) {
       issues.push({
         agentId: "risk_report",
         issue: {
@@ -227,96 +367,4 @@ function buildReviewResult(result: SubagentResult, issues: ReviewIssue[]): Revie
         }
       : {}),
   };
-}
-
-function hasEvidenceClaimRelevance(statement: string, evidence: EvidenceItem[]): boolean {
-  const ignoredTerms = new Set(GENERIC_TERMS);
-  for (const item of evidence) {
-    const target = extractEvidenceTarget(item);
-    if (target) {
-      for (const term of extractSignalTerms(target, new Set())) ignoredTerms.add(term);
-    }
-  }
-
-  const claimTerms = extractSignalTerms(statement, ignoredTerms);
-  if (claimTerms.size === 0) return false;
-
-  const evidenceText = evidence.map(evidenceToText).join("\n");
-  const evidenceTerms = extractSignalTerms(evidenceText, ignoredTerms);
-  let overlap = 0;
-  for (const term of claimTerms) {
-    if (evidenceTerms.has(term)) overlap += 1;
-    if (overlap >= 2) return true;
-  }
-  return overlap >= Math.min(2, claimTerms.size);
-}
-
-function hasHighQualityEvidence(evidence: EvidenceItem[]): boolean {
-  return evidence.some((item) => {
-    const confidence = item.quality?.confidence ?? item.confidence;
-    const completeness = item.quality?.completeness ?? 0.7;
-    const hasInvalidSchema = item.quality?.warnings.some((warning) => warning.startsWith("missing:")) ?? false;
-    return confidence >= 0.55 && completeness >= 0.6 && !hasInvalidSchema;
-  });
-}
-
-function extractSignalTerms(text: string, ignoredTerms: Set<string>): Set<string> {
-  const terms = new Set<string>();
-  const normalized = text.toLowerCase();
-
-  for (const match of normalized.matchAll(/[a-z0-9][a-z0-9_-]{2,}/g)) {
-    const term = match[0] ?? "";
-    if (!ignoredTerms.has(term)) terms.add(term);
-  }
-
-  for (const match of normalized.matchAll(/\p{Script=Han}{2,}/gu)) {
-    const sequence = match[0] ?? "";
-    for (let index = 0; index < sequence.length - 1; index += 1) {
-      const term = sequence.slice(index, index + 2);
-      if (!ignoredTerms.has(term)) terms.add(term);
-    }
-  }
-
-  return terms;
-}
-
-function evidenceToText(item: EvidenceItem): string {
-  return [
-    item.source_name,
-    item.query,
-    item.raw_text ?? "",
-    item.raw_ref ?? "",
-    stringifyValue(item.value),
-  ].join("\n").toLowerCase();
-}
-
-function extractEvidenceTarget(item: EvidenceItem): string | undefined {
-  if (item.value && typeof item.value === "object" && "target" in item.value) {
-    const target = (item.value as { target?: unknown }).target;
-    if (typeof target === "string") return target;
-  }
-  return undefined;
-}
-
-function collectResultText(result: SubagentResult): string {
-  return [
-    result.summary,
-    ...result.findings.map((finding) => finding.statement),
-    ...result.assumptions,
-    ...result.open_questions,
-  ].join("\n").toLowerCase();
-}
-
-function containsAny(text: string, terms: string[]): boolean {
-  const normalized = text.toLowerCase();
-  return terms.some((term) => normalized.includes(term.toLowerCase()));
-}
-
-function stringifyValue(value: unknown): string {
-  if (value === undefined) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
