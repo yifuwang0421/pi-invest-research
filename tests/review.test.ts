@@ -75,6 +75,57 @@ test("review rejects structured output with missing evidence references", () => 
   assert.match(review.issues.join("\n"), /cites missing evidence/);
 });
 
+test("review sorts issues by severity and emits prioritized revision guidance", () => {
+  const result = buildResult("research_evidence", {
+    summary: "Evidence summary uses weak structure.",
+    findings: [{ statement: "CATL revenue growth is available.", evidence_ids: ["missing-ev"], confidence: 0.7 }],
+    evidence: [evidence],
+    structured_output: {
+      ...(structuredOutputFor("research_evidence") as ResearchEvidenceStructuredOutput),
+      fact_table: [
+        {
+          fact: "CATL revenue growth is available.",
+          domain: "other",
+          evidence_ids: ["missing-ev"],
+          confidence: 0.2,
+          as_of: "2026-06-10",
+        },
+        {
+          fact: "CATL margin pressure is available.",
+          domain: "other",
+          evidence_ids: ["missing-ev"],
+          confidence: 0.2,
+          as_of: "2026-06-10",
+        },
+      ],
+    },
+  });
+
+  const review = reviewSubagentResult(result);
+
+  assert.equal(review.pass, false);
+  assert.equal(review.revision_action, "revise");
+  assert.match(review.issues[0] ?? "", /^\[critical\]/);
+  assert.match(review.revision_instruction ?? "", /Fix \d+ critical issues? first/);
+  assert.match(review.revision_instruction ?? "", /Finally clean up \d+ minor issues?/);
+});
+
+test("review checks open questions for consistency with data gaps", () => {
+  const result = buildResult("research_evidence", {
+    summary: "Evidence summary includes an unsupported open question.",
+    findings: [{ statement: "CATL revenue growth and margin pressure are available.", evidence_ids: ["ev-1"], confidence: 0.7 }],
+    evidence: [evidence],
+    open_questions: ["   ", "Need supplier concentration evidence."],
+    data_gaps: [],
+  });
+
+  const review = reviewSubagentResult(result);
+
+  assert.equal(review.pass, false);
+  assert.match(review.issues.join("\n"), /Open question 0 is empty/);
+  assert.match(review.issues.join("\n"), /without corresponding data gaps/);
+});
+
 test("review accepts contract-complete evidence-backed results for all agents", () => {
   const reviews = reviewSubagentResults([
     buildResult("research_evidence", {

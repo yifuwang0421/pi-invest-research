@@ -11,9 +11,11 @@ import type {
   ResearchDataAdapters,
   ResearchPlan,
   ResearchRequest,
+  ReviewResult,
   SubagentExecutionTrace,
   SubagentId,
   SubagentResult,
+  SubagentRevisionContext,
   SubagentTask,
   TaskType,
 } from "./schemas.js";
@@ -30,6 +32,7 @@ const FULL_RESEARCH_AGENTS: SubagentId[] = ["research_evidence", "thesis_valuati
 const EVIDENCE_AND_RISK_AGENTS: SubagentId[] = ["research_evidence", "risk_report"];
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3;
 const DEFAULT_MAX_SPAWN_DEPTH = 1;
+const DEFAULT_MAX_REVISION_ROUNDS = 2;
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
 
 export interface OrchestratorOptions {
@@ -39,7 +42,10 @@ export interface OrchestratorOptions {
   llmTimeoutMs?: number;
   signal?: AbortSignal;
   skillTextByAgent?: Partial<Record<SubagentId, string>>;
-  delegation?: Partial<Pick<DelegationPolicy, "max_concurrency" | "max_spawn_depth" | "allow_nested_orchestrators">>;
+  delegation?: Partial<Pick<
+    DelegationPolicy,
+    "max_concurrency" | "max_spawn_depth" | "max_revision_rounds" | "allow_nested_orchestrators"
+  >>;
 }
 
 export async function investResearch(
@@ -53,29 +59,36 @@ export async function investResearch(
 
   const providers = options.evidenceProviders ?? createDefaultEvidenceProviders(input, options);
   const llmAdapter = options.llmAdapter ?? createDefaultLLMAdapter(input);
+  const maxConcurrency = options.delegation?.max_concurrency ?? plan.delegation_policy.max_concurrency;
+  const maxRevisionRounds = options.delegation?.max_revision_rounds ?? plan.delegation_policy.max_revision_rounds;
+  const llmTimeoutMs = options.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
+  const skillTextByAgent = options.skillTextByAgent ?? {};
   const delegated = await runDelegatedSubagentBatch(
     plan.tasks,
     providers,
     llmAdapter,
     plan.normalized_request,
-    options.skillTextByAgent ?? {},
-    options.delegation?.max_concurrency ?? plan.delegation_policy.max_concurrency,
-    options.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS,
+    skillTextByAgent,
+    maxConcurrency,
+    llmTimeoutMs,
     options.signal,
   );
 
-  const reviews = reviewSubagentResults(delegated.results);
-  const revisedResults = delegated.results.map((result, index) => {
-    const review = reviews[index];
-    if (!review || review.pass) return result;
-    return {
-      ...result,
-      needs_revision: true,
-      open_questions: [...result.open_questions, ...(review.revision_instruction ? [review.revision_instruction] : [])],
-    };
-  });
+  const revised = await runReviewRevisionLoop(
+    plan.tasks,
+    providers,
+    llmAdapter,
+    plan.normalized_request,
+    skillTextByAgent,
+    delegated.results,
+    delegated.executions,
+    maxRevisionRounds,
+    maxConcurrency,
+    llmTimeoutMs,
+    options.signal,
+  );
 
-  return buildFinalReport(plan, revisedResults, reviewSubagentResults(revisedResults), delegated.executions);
+  return buildFinalReport(plan, revised.results, revised.reviews, revised.executions);
 }
 
 export function buildResearchPlan(input: ResearchRequest): ResearchPlan {
@@ -153,20 +166,28 @@ export async function runSubagentTask(
   upstreamResults: SubagentResult[] = [],
   llmTimeoutMs = DEFAULT_LLM_TIMEOUT_MS,
   parentSignal?: AbortSignal,
+  revisionContext?: SubagentRevisionContext,
 ): Promise<SubagentResult> {
   let evidenceResult: Awaited<ReturnType<typeof collectEvidenceForTask>>;
-  try {
-    evidenceResult = await collectEvidenceForTask(task, providers);
-  } catch (error) {
-    const occurredAt = new Date().toISOString();
-    return createLLMErrorResult(task, [], [
-      {
-        source_name: "source-provider",
-        query: task.task,
-        reason: error instanceof Error ? error.message : String(error),
-        occurred_at: occurredAt,
-      },
-    ]);
+  if (revisionContext) {
+    evidenceResult = {
+      evidence: revisionContext.prior_result.evidence,
+      data_gaps: revisionContext.prior_result.data_gaps,
+    };
+  } else {
+    try {
+      evidenceResult = await collectEvidenceForTask(task, providers);
+    } catch (error) {
+      const occurredAt = new Date().toISOString();
+      return createLLMErrorResult(task, [], [
+        {
+          source_name: "source-provider",
+          query: task.task,
+          reason: error instanceof Error ? error.message : String(error),
+          occurred_at: occurredAt,
+        },
+      ]);
+    }
   }
 
   const timeout = createTimeoutSignal(llmTimeoutMs, parentSignal);
@@ -186,6 +207,7 @@ export async function runSubagentTask(
         ...(result.structured_output ? { structured_output: result.structured_output } : {}),
         needs_revision: result.needs_revision,
       })),
+      ...(revisionContext ? { revision_context: revisionContext } : {}),
       ...(timeout.signal ? { signal: timeout.signal } : {}),
     };
     return await withTimeout(
@@ -255,11 +277,211 @@ export async function runDelegatedSubagentBatch(
   };
 }
 
+async function runReviewRevisionLoop(
+  tasks: SubagentTask[],
+  providers: EvidenceProvider[],
+  llmAdapter: LLMAdapter,
+  normalizedRequest: NormalizedResearchRequest,
+  skillTextByAgent: Partial<Record<SubagentId, string>>,
+  initialResults: SubagentResult[],
+  initialExecutions: SubagentExecutionTrace[],
+  maxRevisionRounds: number,
+  maxConcurrency: number,
+  llmTimeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ results: SubagentResult[]; reviews: ReviewResult[]; executions: SubagentExecutionTrace[] }> {
+  const resultsByAgent = new Map(initialResults.map((result) => [result.agent_id, result]));
+  const executions = [...initialExecutions];
+  const maxRounds = Math.max(0, Math.floor(maxRevisionRounds));
+  let reviews = reviewSubagentResults(orderedResults(tasks, resultsByAgent));
+  const staleReviews = new Map<SubagentId, ReviewResult>();
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const rerunAgents = new Set(reviews.filter((review) => shouldRevise(review)).map((review) => review.agent_id));
+    if (rerunAgents.size === 0) break;
+
+    while (rerunAgents.size > 0) {
+      const ready = tasks
+        .map((task, index) => ({ task, index }))
+        .filter(({ task }) =>
+          rerunAgents.has(task.agent_id) &&
+          task.depends_on.every((agentId) => !rerunAgents.has(agentId)),
+        );
+      if (ready.length === 0) {
+        throw new Error(`Revision dependency cycle or missing dependency: ${[...rerunAgents].join(", ")}`);
+      }
+
+      const stage = await runRevisionSubagentStage(
+        ready,
+        Math.max(1, Math.floor(maxConcurrency)),
+        providers,
+        llmAdapter,
+        normalizedRequest,
+        skillTextByAgent,
+        resultsByAgent,
+        reviews,
+        staleReviews,
+        round,
+        maxRounds,
+        llmTimeoutMs,
+        signal,
+      );
+
+      const changedAgents = new Set<SubagentId>();
+      for (const item of stage) {
+        const priorResult = resultsByAgent.get(item.task.agent_id);
+        resultsByAgent.set(item.task.agent_id, item.result);
+        executions.push(item.execution);
+        staleReviews.delete(item.task.agent_id);
+        rerunAgents.delete(item.task.agent_id);
+        if (priorResult && upstreamSemanticallyChanged(priorResult, item.result)) {
+          changedAgents.add(item.task.agent_id);
+        }
+      }
+
+      reviews = reviewSubagentResults(orderedResults(tasks, resultsByAgent));
+      for (const item of stage) {
+        const updatedReview = reviews.find((review) => review.agent_id === item.task.agent_id);
+        if (!updatedReview?.pass) continue;
+        if (!changedAgents.has(item.task.agent_id)) continue;
+        for (const dependent of tasks.filter((candidate) => candidate.depends_on.includes(item.task.agent_id))) {
+          const dependentReview = reviews.find((review) => review.agent_id === dependent.agent_id);
+          if (dependentReview?.pass) {
+            rerunAgents.add(dependent.agent_id);
+            staleReviews.set(dependent.agent_id, buildStaleDependencyReview(dependent.agent_id, [item.task.agent_id]));
+          }
+        }
+      }
+    }
+
+    reviews = reviewSubagentResults(orderedResults(tasks, resultsByAgent));
+  }
+
+  return {
+    results: orderedResults(tasks, resultsByAgent),
+    reviews,
+    executions,
+  };
+}
+
+async function runRevisionSubagentStage(
+  ready: Array<{ task: SubagentTask; index: number }>,
+  maxConcurrency: number,
+  providers: EvidenceProvider[],
+  llmAdapter: LLMAdapter,
+  normalizedRequest: NormalizedResearchRequest,
+  skillTextByAgent: Partial<Record<SubagentId, string>>,
+  resultsByAgent: Map<SubagentId, SubagentResult>,
+  reviews: ReviewResult[],
+  staleReviews: Map<SubagentId, ReviewResult>,
+  round: number,
+  maxRounds: number,
+  llmTimeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<Array<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }>> {
+  const output: Array<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }> = [];
+  let cursor = 0;
+  const workerCount = Math.min(maxConcurrency, ready.length);
+
+  async function worker(): Promise<void> {
+    while (cursor < ready.length) {
+      const item = ready[cursor++];
+      if (!item) continue;
+      const priorResult = resultsByAgent.get(item.task.agent_id);
+      if (!priorResult) continue;
+      const currentReview = reviews.find((review) => review.agent_id === item.task.agent_id);
+      const revisionReview = currentReview && shouldRevise(currentReview)
+        ? currentReview
+        : staleReviews.get(item.task.agent_id) ?? buildStaleDependencyReview(item.task.agent_id, item.task.depends_on);
+      const upstreamResults = item.task.depends_on
+        .map((agentId) => resultsByAgent.get(agentId))
+        .filter((result): result is SubagentResult => Boolean(result));
+      const revisionContext = {
+        round,
+        max_rounds: maxRounds,
+        prior_result: priorResult,
+        review: revisionReview,
+      };
+      const revision = await runTracedSubagentTask(
+        item.task,
+        item.index,
+        providers,
+        llmAdapter,
+        normalizedRequest,
+        skillTextByAgent[item.task.agent_id] ?? "",
+        upstreamResults,
+        llmTimeoutMs,
+        signal,
+        revisionContext,
+      );
+      output.push({
+        ...revision,
+        result: attachRevisionHistory(revision.result, priorResult, revisionContext.review, round),
+      });
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return output;
+}
+
 function dependenciesFor(agentId: SubagentId, selectedAgents: SubagentId[]): SubagentId[] {
   if (agentId === "risk_report") {
     return selectedAgents.filter((id) => id !== "risk_report");
   }
   return [];
+}
+
+function orderedResults(tasks: SubagentTask[], resultsByAgent: Map<SubagentId, SubagentResult>): SubagentResult[] {
+  return tasks
+    .map((task) => resultsByAgent.get(task.agent_id))
+    .filter((result): result is SubagentResult => Boolean(result));
+}
+
+function attachRevisionHistory(
+  result: SubagentResult,
+  priorResult: SubagentResult,
+  review: ReviewResult,
+  round: number,
+): SubagentResult {
+  return {
+    ...result,
+    revision_history: [
+      ...(priorResult.revision_history ?? []),
+      {
+        round,
+        review,
+      },
+    ],
+  };
+}
+
+function upstreamSemanticallyChanged(before: SubagentResult, after: SubagentResult): boolean {
+  return stableSemanticSnapshot(before) !== stableSemanticSnapshot(after);
+}
+
+function stableSemanticSnapshot(result: SubagentResult): string {
+  return JSON.stringify({
+    summary: result.summary,
+    findings: result.findings,
+    structured_output: result.structured_output ?? null,
+  });
+}
+
+function buildStaleDependencyReview(agentId: SubagentId, upstreamAgents: SubagentId[]): ReviewResult {
+  const upstreamNames = upstreamAgents.length > 0 ? upstreamAgents.join(", ") : "upstream dependency";
+  return {
+    agent_id: agentId,
+    pass: false,
+    score: 0,
+    issues: [`[major] Upstream result changed: ${upstreamNames}. Regenerate against the latest upstream_results.`],
+    revision_action: "revise",
+    revision_instruction: "Regenerate the complete result using the latest upstream_results while preserving the output contract.",
+  };
+}
+
+function shouldRevise(review: ReviewResult): boolean {
+  return !review.pass && review.revision_action !== "needs_evidence";
 }
 
 function createDefaultEvidenceProviders(input: ResearchRequest, options: OrchestratorOptions): EvidenceProvider[] {
@@ -282,6 +504,7 @@ function buildDelegationPolicy(taskCount: number): DelegationPolicy {
     mode: taskCount <= 1 ? "single" : "batch",
     max_concurrency: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
+    max_revision_rounds: DEFAULT_MAX_REVISION_ROUNDS,
     allow_nested_orchestrators: false,
     summary_only: true,
   };
@@ -388,9 +611,10 @@ async function runTracedSubagentTask(
   upstreamResults: SubagentResult[],
   llmTimeoutMs: number,
   signal: AbortSignal | undefined,
+  revisionContext?: SubagentRevisionContext,
 ): Promise<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }> {
   const started = new Date();
-  const executionIds = buildExecutionIds(task.agent_id, taskIndex);
+  const executionIds = buildExecutionIds(task.agent_id, taskIndex, revisionContext?.round);
   try {
     const result = await runSubagentTask(
       task,
@@ -401,6 +625,7 @@ async function runTracedSubagentTask(
       upstreamResults,
       llmTimeoutMs,
       signal,
+      revisionContext,
     );
     const completed = new Date();
     return {
@@ -410,13 +635,14 @@ async function runTracedSubagentTask(
         task_index: taskIndex,
         agent_id: task.agent_id,
         role: task.role,
-        status: "completed",
+        status: revisionContext ? "revised" : "completed",
         started_at: started.toISOString(),
         completed_at: completed.toISOString(),
         duration_ms: completed.getTime() - started.getTime(),
         evidence_count: result.evidence.length,
         data_gap_count: result.data_gaps.length,
         upstream_agents: task.depends_on,
+        ...(revisionContext ? { revision_round: revisionContext.round, revision_of: task.agent_id } : {}),
         ...executionIds,
       },
     };
@@ -444,6 +670,7 @@ async function runTracedSubagentTask(
         evidence_count: 0,
         data_gap_count: result.data_gaps.length,
         upstream_agents: task.depends_on,
+        ...(revisionContext ? { revision_round: revisionContext.round, revision_of: task.agent_id } : {}),
         error: error instanceof Error ? error.message : String(error),
         ...executionIds,
       },
@@ -451,15 +678,16 @@ async function runTracedSubagentTask(
   }
 }
 
-function buildExecutionIds(agentId: SubagentId, taskIndex: number): Pick<
+function buildExecutionIds(agentId: SubagentId, taskIndex: number, revisionRound?: number): Pick<
   SubagentExecutionTrace,
   "context_id" | "terminal_session_id" | "workspace_id"
 > {
   const ordinal = String(taskIndex + 1).padStart(2, "0");
+  const revisionSuffix = revisionRound !== undefined ? `-r${revisionRound}` : "";
   return {
-    context_id: `ctx-${ordinal}-${agentId}`,
-    terminal_session_id: `term-${ordinal}-${agentId}`,
-    workspace_id: `workspace-${ordinal}-${agentId}`,
+    context_id: `ctx-${ordinal}-${agentId}${revisionSuffix}`,
+    terminal_session_id: `term-${ordinal}-${agentId}${revisionSuffix}`,
+    workspace_id: `workspace-${ordinal}-${agentId}${revisionSuffix}`,
   };
 }
 

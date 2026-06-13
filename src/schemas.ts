@@ -14,7 +14,7 @@ export type DelegationMode = "single" | "batch";
 
 export type SubagentRole = "leaf" | "orchestrator";
 
-export type SubagentExecutionStatus = "completed" | "failed";
+export type SubagentExecutionStatus = "completed" | "failed" | "revised";
 
 export type SubagentId =
   | "research_evidence"
@@ -377,6 +377,10 @@ export interface SubagentResult {
   data_gaps: DataGap[];
   structured_output?: SubagentStructuredOutput;
   needs_revision: boolean;
+  revision_history?: Array<{
+    round: number;
+    review: ReviewResult;
+  }>;
 }
 
 export interface ReviewResult {
@@ -384,7 +388,15 @@ export interface ReviewResult {
   pass: boolean;
   score: number;
   issues: string[];
+  revision_action?: "revise" | "needs_evidence";
   revision_instruction?: string;
+}
+
+export interface SubagentRevisionContext {
+  round: number;
+  max_rounds: number;
+  prior_result: SubagentResult;
+  review: ReviewResult;
 }
 
 export interface ResearchPlan {
@@ -400,6 +412,7 @@ export interface DelegationPolicy {
   mode: DelegationMode;
   max_concurrency: number;
   max_spawn_depth: number;
+  max_revision_rounds: number;
   allow_nested_orchestrators: boolean;
   summary_only: boolean;
 }
@@ -418,6 +431,8 @@ export interface SubagentExecutionTrace {
   context_id: string;
   terminal_session_id: string;
   workspace_id: string;
+  revision_round?: number;
+  revision_of?: SubagentId;
   error?: string;
 }
 
@@ -468,6 +483,7 @@ export interface LLMGenerateRequest {
   skill_text: string;
   delegation_context?: string;
   upstream_results?: Array<Pick<SubagentResult, "agent_id" | "summary" | "findings" | "data_gaps" | "structured_output" | "needs_revision">>;
+  revision_context?: SubagentRevisionContext;
   signal?: AbortSignal;
 }
 

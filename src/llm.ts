@@ -223,6 +223,8 @@ function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
         "你是严谨的投资研究子 agent。",
         "你运行在独立上下文、独立终端会话和独立工作区中，只能使用本次输入里的 task、evidence、data_gaps 和 upstream_results。",
         "所有事实性判断必须引用 evidence_ids；无法由证据支持的内容必须放入 assumptions 或 data_gaps。",
+        "如果 revision_context 存在，你是在返工：必须逐条修复 review.issues，返回完整 JSON 结果而不是差异补丁。",
+        "返工时只能复用本次 evidence 中存在的 evidence_ids，不能编造新证据或引用不存在的 evidence id。",
         "只返回 JSON 对象，不要 Markdown，不要代码围栏。",
       ].join("\n"),
     },
@@ -238,6 +240,25 @@ function buildMessages(request: LLMGenerateRequest): ChatMessage[] {
           evidence: summarizeEvidenceForLLM(request.evidence),
           data_gaps: request.data_gaps,
           upstream_results: request.upstream_results ?? [],
+          revision_context: request.revision_context
+            ? {
+                round: request.revision_context.round,
+                max_rounds: request.revision_context.max_rounds,
+                review: request.revision_context.review,
+                prior_result: {
+                  agent_id: request.revision_context.prior_result.agent_id,
+                  task: request.revision_context.prior_result.task,
+                  summary: request.revision_context.prior_result.summary,
+                  findings: request.revision_context.prior_result.findings,
+                  assumptions: request.revision_context.prior_result.assumptions,
+                  open_questions: request.revision_context.prior_result.open_questions,
+                  confidence: request.revision_context.prior_result.confidence,
+                  data_gaps: request.revision_context.prior_result.data_gaps,
+                  structured_output: request.revision_context.prior_result.structured_output,
+                  needs_revision: request.revision_context.prior_result.needs_revision,
+                },
+              }
+            : undefined,
           required_shape: {
             agent_id: request.task.agent_id,
             ...REQUIRED_RESULT_SHAPE_TEMPLATE,

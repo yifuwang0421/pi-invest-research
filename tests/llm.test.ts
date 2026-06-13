@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createOpenAICompatibleLLMAdapter } from "../src/llm.js";
 import { SUBAGENT_OUTPUT_CONTRACTS } from "../src/output-contracts.js";
-import type { LLMGenerateRequest, SubagentStructuredOutput } from "../src/schemas.js";
+import type { LLMGenerateRequest, SubagentResult, SubagentStructuredOutput } from "../src/schemas.js";
 
 test("OpenAI-compatible LLM adapter sends chat completion request and parses JSON", async () => {
   const calls: string[] = [];
@@ -41,6 +41,66 @@ test("OpenAI-compatible LLM adapter sends chat completion request and parses JSO
   assert.deepEqual(calls, ["test-model"]);
   assert.equal(result.summary, "观点与估值完成。");
   assert.equal(result.findings[0]?.evidence_ids[0], "ev-1");
+});
+
+test("OpenAI-compatible LLM adapter includes revision context in the prompt payload", async () => {
+  let promptPayload: {
+    revision_context?: {
+      round?: number;
+      max_rounds?: number;
+      review?: { issues?: string[] };
+      prior_result?: { summary?: string };
+    };
+  } = {};
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+    const userMessage = body.messages.find((message) => message.role === "user");
+    promptPayload = JSON.parse(userMessage?.content ?? "{}") as typeof promptPayload;
+    return jsonResponse({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              summary: "修订后的观点与估值完成。",
+              findings: [{ statement: "证据显示经营情况可继续跟踪。", evidence_ids: ["ev-1"], confidence: 0.7 }],
+              assumptions: [],
+              open_questions: [],
+              confidence: 0.7,
+              structured_output: validThesisStructuredOutput(),
+              needs_revision: false,
+            }),
+          },
+        },
+      ],
+    });
+  };
+
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+  });
+  const request = makeLLMRequest();
+  await adapter.generateSubagentResult({
+    ...request,
+    revision_context: {
+      round: 1,
+      max_rounds: 2,
+      prior_result: validPriorResult(),
+      review: {
+        agent_id: "thesis_valuation",
+        pass: false,
+        score: 70,
+        issues: ["[critical] thesis_valuation.theses[0].evidence_ids cites missing evidence: missing-ev."],
+        revision_instruction: "Fix missing evidence citations.",
+      },
+    },
+  });
+
+  assert.equal(promptPayload.revision_context?.round, 1);
+  assert.equal(promptPayload.revision_context?.max_rounds, 2);
+  assert.match(promptPayload.revision_context?.review?.issues?.join("\n") ?? "", /missing evidence/);
+  assert.equal(promptPayload.revision_context?.prior_result?.summary, "Prior thesis summary.");
 });
 
 test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
@@ -244,6 +304,22 @@ function validThesisStructuredOutput(): SubagentStructuredOutput {
         evidence_ids: ["ev-1"],
       },
     ],
+  };
+}
+
+function validPriorResult(): SubagentResult {
+  return {
+    agent_id: "thesis_valuation",
+    task: "观点与估值",
+    summary: "Prior thesis summary.",
+    findings: [{ statement: "Prior finding cited a missing id.", evidence_ids: ["missing-ev"], confidence: 0.5 }],
+    evidence: makeLLMRequest().evidence,
+    assumptions: [],
+    open_questions: ["Needs citation repair."],
+    confidence: 0.5,
+    data_gaps: [],
+    structured_output: validThesisStructuredOutput(),
+    needs_revision: true,
   };
 }
 
