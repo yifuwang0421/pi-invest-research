@@ -20,6 +20,8 @@ export interface AnalystAgentRunOptions {
   fixturePath?: string;
   mockLLM?: boolean;
   llmTimeoutMs?: number;
+  maxConcurrency?: number;
+  llmRetries?: number;
   signal?: AbortSignal;
   llmAdapter?: LLMAdapter;
   evidenceProviders?: EvidenceProvider[];
@@ -54,6 +56,7 @@ export async function runAnalystAgent(
   const llmOptions: OpenAICompatibleLLMOptions = {};
   if (input.llm?.base_url) llmOptions.baseUrl = input.llm.base_url;
   if (input.llm?.model) llmOptions.model = input.llm.model;
+  if (options.llmRetries !== undefined) llmOptions.maxRetries = options.llmRetries;
   const llmAdapter = options.llmAdapter ?? (options.mockLLM ? createMockLLMAdapter() : createOpenAICompatibleLLMAdapter(llmOptions));
   const skillTextByAgent = await loadSkillTextByAgent();
   const result = await investResearch(
@@ -65,6 +68,7 @@ export async function runAnalystAgent(
       evidenceProviders,
       llmAdapter,
       ...(options.llmTimeoutMs !== undefined ? { llmTimeoutMs: options.llmTimeoutMs } : {}),
+      ...(options.maxConcurrency !== undefined ? { delegation: { max_concurrency: options.maxConcurrency } } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
       skillTextByAgent,
     },

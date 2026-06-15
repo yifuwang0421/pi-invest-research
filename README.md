@@ -86,7 +86,7 @@ $env:OPENAI_API_KEY="你的 DeepSeek API Key"
 $env:OPENAI_BASE_URL="https://api.deepseek.com"
 $env:OPENAI_MODEL="deepseek-v4-pro"
 
-npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/maotai-deepseek
+npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/maotai-deepseek --max-concurrency 1 --llm-retries 3
 ```
 
 如需离线验证流程，但不调用真实 LLM，请加 `--fixture`：
@@ -103,6 +103,9 @@ npm.cmd run agent -- --request "做贵州茅台深度研究" --no-live-ifind --f
 - `--task-type <type>`：可选，`deep_research`、`technical_review`、`risk_review`、`valuation`、`news_event` 或 `general`。
 - `--out <dir>`：输出目录，默认是 `reports/run-<timestamp>`。
 - `--format <format>`：输出格式，`markdown` 或 `json`，默认 `markdown`。
+- `--llm-timeout-ms <ms>`：单个子 agent 的 LLM 超时时间，默认 `120000`。
+- `--max-concurrency <n>`：最大并发子 agent 数，范围 `1..8`，默认 `3`。
+- `--llm-retries <n>`：initial + repair 共享的 HTTP/network 总重试预算，范围 `0..5`，默认 `2`。
 - `--no-live-ifind`：禁用实时 iFinD 调用。
 - `--fixture [path]`：使用 fixture 证据和 mock LLM，适合离线验收。
 
@@ -136,7 +139,7 @@ npm.cmd run agent -- --request "做宁德时代深度研究" --no-live-ifind --f
 $env:OPENAI_API_KEY="你的 DeepSeek API Key"
 $env:OPENAI_BASE_URL="https://api.deepseek.com"
 $env:OPENAI_MODEL="deepseek-v4-pro"
-npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/acceptance-deepseek
+npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/acceptance-deepseek --max-concurrency 1 --llm-retries 3
 ```
 
 预期：
@@ -146,6 +149,8 @@ npm.cmd run agent -- --request "做贵州茅台深度研究" --out reports/accep
 - 报告是可读中文，没有乱码。
 - trace 中只出现三个子 agent：`research_evidence`、`thesis_valuation`、`risk_report`。
 - trace 中每个子 agent 都有 `context_id`、`terminal_session_id` 和 `workspace_id`。
+- trace 中每个子 agent 都包含 `llm_retry_budget`、`llm_attempt_count`、`llm_retry_count`、`llm_total_retry_delay_ms` 和脱敏的 `llm_attempts`。
+- 真实 LLM 调用内部带共享最小间隔、Retry-After 抖动和 5xx 熔断器，用于降低并发 worker 同时打爆同一 endpoint 的风险。
 
 ## 安全说明
 

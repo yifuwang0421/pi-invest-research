@@ -4,7 +4,7 @@ import { createInvestResearchTool, createMockLLMAdapter, investResearch } from "
 import { buildSubagentTask, runSubagentTask } from "../src/orchestrator.js";
 import { createMockIFindAdapter } from "../src/ifind-adapter.js";
 import { createFallbackStructuredOutput } from "../src/output-contracts.js";
-import type { FinalReport, LLMAdapter, LLMGenerateRequest, SubagentId, SubagentResult } from "../src/schemas.js";
+import type { FinalReport, LLMAdapter, LLMAttemptTrace, LLMGenerateRequest, SubagentId, SubagentResult } from "../src/schemas.js";
 import { createEvidenceProviders } from "../src/sources.js";
 
 test("investResearch produces a Markdown report with the compressed three-agent pipeline", async () => {
@@ -23,7 +23,7 @@ test("investResearch produces a Markdown report with the compressed three-agent 
   assert.ok(!("clarification_question" in result));
   const report = result as FinalReport;
   assert.deepEqual(report.selected_agents, ["research_evidence", "thesis_valuation", "risk_report"]);
-  assert.match(report.markdown, /# 宁德时代 投研分析报告/);
+  assert.match(report.markdown, /# 宁德时代 投资研究 Memo/);
   assert.ok(report.evidence_ledger.length > 0);
   assert.ok(!report.markdown.includes("workflow JSON"));
   assert.equal(report.trace.delegation_executions.length, 3);
@@ -35,20 +35,28 @@ test("investResearch produces a Markdown report with the compressed three-agent 
     report.trace.subagent_results.map((result) => result.structured_output?.agent_id),
     report.trace.subagent_results.map((result) => result.agent_id),
   );
-  assert.match(report.markdown, /## Structured Agent Outputs/);
-  assert.match(report.markdown, /Fact Table/);
-  assert.match(report.markdown, /\[(quote|financials|announcement|news|profile|macro|other)\]/);
-  assert.match(report.markdown, /Thesis And Valuation/);
-  assert.match(report.markdown, /\[(bullish|neutral|bearish|mixed)\]/);
-  assert.match(report.markdown, /Valuation framework: evidence-led qualitative framework; (fairly_valued|insufficient_data)/);
-  assert.match(report.markdown, /Scenario variable: evidence quality/);
-  assert.match(report.markdown, /Risk And Counter Evidence/);
-  assert.match(report.markdown, /Counter-evidence \[(low|medium|high)\]/);
-  assert.match(report.markdown, /Trigger: Evidence quality deteriorates or key data remains unavailable/);
+  assert.match(report.markdown, /# 宁德时代 投资研究 Memo/);
+  assert.match(report.markdown, /## 投资结论/);
+  assert.match(report.markdown, /## 核心证据/);
+  assert.match(report.markdown, /## 关键数据/);
+  assert.match(report.markdown, /## 估值\/情景/);
+  assert.match(report.markdown, /## 风险与反证/);
+  assert.match(report.markdown, /## 数据缺口/);
+  assert.match(report.markdown, /## 研究质量说明/);
+  assert.match(report.markdown, /## 附录 Evidence Ledger/);
+  assert.match(report.markdown, /情景矩阵/);
+  assert.match(report.markdown, /反证清单/);
+  assert.match(report.markdown, /风险触发器/);
+  assert.doesNotMatch(report.markdown, /Structured Agent Outputs/);
+  assert.doesNotMatch(report.markdown, /三段式 agent 摘要/);
+  assert.doesNotMatch(report.markdown, /## 评审结果/);
   assert.match(
     report.trace.delegation_executions[0]?.terminal_session_id ?? "",
     /^term-\d+-/,
   );
+  assert.equal(report.trace.delegation_executions[0]?.llm_attempt_count, 0);
+  assert.equal(report.trace.delegation_executions[0]?.llm_retry_count, 0);
+  assert.deepEqual(report.trace.delegation_executions[0]?.llm_attempts, []);
 });
 
 test("technical live adapter path uses evidence plus risk/report agents", async () => {
@@ -68,6 +76,38 @@ test("technical live adapter path uses evidence plus risk/report agents", async 
   assert.deepEqual(report.selected_agents, ["research_evidence", "risk_report"]);
   assert.ok(report.evidence_ledger.length >= 2);
   assert.ok(report.markdown.includes("mock-ifind-stock"));
+});
+
+test("investResearch records LLM attempt telemetry in delegation trace", async () => {
+  const adapter: LLMAdapter = {
+    async generateSubagentResult(request) {
+      request.onLLMAttempt?.(makeAttemptTrace("retry", 25));
+      request.onLLMAttempt?.(makeAttemptTrace("success"));
+      return buildMockSubagentResult(request);
+    },
+  };
+
+  const result = await investResearch(
+    {
+      request: "Summarize CATL",
+      target: "CATL",
+      task_type: "general",
+      sources: ["fixture"],
+      use_live_ifind: false,
+    },
+    {
+      evidenceProviders: createEvidenceProviders(["fixture"]),
+      llmAdapter: adapter,
+    },
+  );
+
+  assert.ok(!("clarification_question" in result));
+  const report = result as FinalReport;
+  const firstExecution = report.trace.delegation_executions[0];
+  assert.equal(firstExecution?.llm_attempt_count, 2);
+  assert.equal(firstExecution?.llm_retry_count, 1);
+  assert.equal(firstExecution?.llm_total_retry_delay_ms, 25);
+  assert.deepEqual(firstExecution?.llm_attempts.map((attempt) => attempt.status), ["retry", "success"]);
 });
 
 test("investResearch reruns a failed subagent with concrete review issues until it passes", async () => {
@@ -343,7 +383,7 @@ test("extension tool registers and can execute", async () => {
     use_live_ifind: false,
   });
 
-  assert.match(result.content[0]?.text ?? "", /贵州茅台 投研分析报告/);
+  assert.match(result.content[0]?.text ?? "", /贵州茅台 投资研究 Memo/);
   assert.ok(typeof result.details === "object" && result.details !== null);
 });
 
@@ -405,5 +445,17 @@ function buildMockSubagentResult(
       findings,
     }),
     needs_revision: options.needsRevision ?? false,
+  };
+}
+
+function makeAttemptTrace(status: LLMAttemptTrace["status"], retryDelayMs?: number): LLMAttemptTrace {
+  return {
+    phase: "initial",
+    attempt: status === "retry" ? 1 : 2,
+    status,
+    started_at: "2026-06-10T00:00:00.000Z",
+    completed_at: "2026-06-10T00:00:00.010Z",
+    duration_ms: 10,
+    ...(retryDelayMs !== undefined ? { retry_delay_ms: retryDelayMs } : {}),
   };
 }

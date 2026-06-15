@@ -417,6 +417,25 @@ export interface DelegationPolicy {
   summary_only: boolean;
 }
 
+export type LLMAttemptPhase = "initial" | "repair";
+
+export type LLMAttemptStatus = "success" | "retry" | "failed";
+
+export interface LLMAttemptTrace {
+  phase: LLMAttemptPhase;
+  attempt: number;
+  status: LLMAttemptStatus;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  http_status?: number;
+  rate_limit_delay_ms?: number;
+  retry_after_ms?: number;
+  retry_delay_ms?: number;
+  error_type?: string;
+  error_message?: string;
+}
+
 export interface SubagentExecutionTrace {
   task_index: number;
   agent_id: SubagentId;
@@ -431,6 +450,11 @@ export interface SubagentExecutionTrace {
   context_id: string;
   terminal_session_id: string;
   workspace_id: string;
+  llm_retry_budget: number;
+  llm_attempt_count: number;
+  llm_retry_count: number;
+  llm_total_retry_delay_ms: number;
+  llm_attempts: LLMAttemptTrace[];
   revision_round?: number;
   revision_of?: SubagentId;
   error?: string;
@@ -485,6 +509,8 @@ export interface LLMGenerateRequest {
   upstream_results?: Array<Pick<SubagentResult, "agent_id" | "summary" | "findings" | "data_gaps" | "structured_output" | "needs_revision">>;
   revision_context?: SubagentRevisionContext;
   signal?: AbortSignal;
+  onLLMRetryBudget?: (retryBudget: number) => void;
+  onLLMAttempt?: (attempt: LLMAttemptTrace) => void;
 }
 
 export interface LLMAdapter {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createOpenAICompatibleLLMAdapter } from "../src/llm.js";
 import { SUBAGENT_OUTPUT_CONTRACTS } from "../src/output-contracts.js";
-import type { LLMGenerateRequest, SubagentResult, SubagentStructuredOutput } from "../src/schemas.js";
+import type { LLMAttemptTrace, LLMGenerateRequest, SubagentResult, SubagentStructuredOutput } from "../src/schemas.js";
 
 test("OpenAI-compatible LLM adapter sends chat completion request and parses JSON", async () => {
   const calls: string[] = [];
@@ -35,6 +35,7 @@ test("OpenAI-compatible LLM adapter sends chat completion request and parses JSO
     baseUrl: "https://example.test/v1",
     model: "test-model",
     fetchImpl,
+    requestMinIntervalMs: 0,
   });
   const result = await adapter.generateSubagentResult(makeLLMRequest());
 
@@ -79,6 +80,7 @@ test("OpenAI-compatible LLM adapter includes revision context in the prompt payl
     apiKey: "test-key",
     model: "test-model",
     fetchImpl,
+    requestMinIntervalMs: 0,
   });
   const request = makeLLMRequest();
   await adapter.generateSubagentResult({
@@ -106,6 +108,7 @@ test("OpenAI-compatible LLM adapter includes revision context in the prompt payl
 test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
   let callCount = 0;
   const repairPrompts: string[] = [];
+  const attempts: LLMAttemptTrace[] = [];
   const fetchImpl: typeof fetch = async (_input, init) => {
     callCount += 1;
     if (callCount === 1) {
@@ -136,19 +139,25 @@ test("OpenAI-compatible LLM adapter retries malformed JSON once", async () => {
     apiKey: "test-key",
     model: "test-model",
     fetchImpl,
+    requestMinIntervalMs: 0,
   });
   const result = await adapter.generateSubagentResult({
     ...makeLLMRequest(),
     signal: new AbortController().signal,
+    onLLMAttempt: (attempt) => attempts.push(attempt),
   });
 
   assert.equal(callCount, 2);
   assert.equal(result.summary, "修复后的结构化结果。");
   assert.match(repairPrompts.join("\n"), /structured_output/);
+  assert.deepEqual(attempts.map((attempt) => attempt.phase), ["initial", "repair"]);
+  assert.deepEqual(attempts.map((attempt) => attempt.status), ["success", "success"]);
 });
 
 test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async () => {
   let callCount = 0;
+  const attempts: LLMAttemptTrace[] = [];
+  const delays: number[] = [];
   const fetchImpl: typeof fetch = async (_input, init) => {
     callCount += 1;
     assert.ok(init?.signal instanceof AbortSignal);
@@ -156,7 +165,7 @@ test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async (
       return new Response(JSON.stringify({ error: "rate limited" }), {
         status: 429,
         statusText: "Too Many Requests",
-        headers: { "retry-after": "0" },
+        headers: { "retry-after": "1" },
       });
     }
     return jsonResponse({
@@ -182,15 +191,195 @@ test("OpenAI-compatible LLM adapter retries HTTP 429 before succeeding", async (
     apiKey: "test-key",
     model: "test-model",
     fetchImpl,
-    retryBaseDelayMs: 0,
+    requestMinIntervalMs: 0,
+    retryBaseDelayMs: 100,
+    random: () => 0.5,
+    delayImpl: async (ms) => {
+      delays.push(ms);
+    },
   });
   const result = await adapter.generateSubagentResult({
     ...makeLLMRequest(),
     signal: new AbortController().signal,
+    onLLMAttempt: (attempt) => attempts.push(attempt),
   });
 
   assert.equal(callCount, 2);
   assert.equal(result.summary, "retry ok");
+  assert.deepEqual(delays, [1100]);
+  assert.equal(attempts[0]?.status, "retry");
+  assert.equal(attempts[0]?.http_status, 429);
+  assert.equal(attempts[0]?.retry_after_ms, 1000);
+  assert.equal(attempts[0]?.retry_delay_ms, 1100);
+  assert.equal(attempts[1]?.status, "success");
+});
+
+test("OpenAI-compatible LLM adapter adds jitter when 429 has no Retry-After", async () => {
+  let callCount = 0;
+  const attempts: LLMAttemptTrace[] = [];
+  const delays: number[] = [];
+  const fetchImpl: typeof fetch = async () => {
+    callCount += 1;
+    if (callCount === 1) {
+      return new Response(JSON.stringify({ error: "rate limited" }), {
+        status: 429,
+        statusText: "Too Many Requests",
+      });
+    }
+    return jsonResponse({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              summary: "jitter retry ok",
+              findings: [{ statement: "evidence is available", evidence_ids: ["ev-1"], confidence: 0.6 }],
+              assumptions: [],
+              open_questions: [],
+              confidence: 0.6,
+              structured_output: validThesisStructuredOutput(),
+              needs_revision: false,
+            }),
+          },
+        },
+      ],
+    });
+  };
+
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    requestMinIntervalMs: 0,
+    retryBaseDelayMs: 100,
+    retryJitterRatio: 0.2,
+    random: () => 0.5,
+    delayImpl: async (ms) => {
+      delays.push(ms);
+    },
+  });
+  const result = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    onLLMAttempt: (attempt) => attempts.push(attempt),
+  });
+
+  assert.equal(result.summary, "jitter retry ok");
+  assert.deepEqual(delays, [110]);
+  assert.equal(attempts[0]?.retry_delay_ms, 110);
+  assert.equal(attempts[0]?.retry_after_ms, undefined);
+});
+
+test("OpenAI-compatible LLM adapter does not retry HTTP errors when maxRetries is zero", async () => {
+  let callCount = 0;
+  const attempts: LLMAttemptTrace[] = [];
+  const fetchImpl: typeof fetch = async () => {
+    callCount += 1;
+    return new Response(JSON.stringify({ error: "rate limited" }), {
+      status: 429,
+      statusText: "Too Many Requests",
+    });
+  };
+
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    requestMinIntervalMs: 0,
+    maxRetries: 0,
+    delayImpl: async () => {
+      throw new Error("delay should not run when retries are disabled");
+    },
+  });
+  const result = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    onLLMAttempt: (attempt) => attempts.push(attempt),
+  });
+
+  assert.equal(callCount, 2);
+  assert.equal(result.needs_revision, true);
+  assert.deepEqual(attempts.map((attempt) => attempt.status), ["failed", "failed"]);
+  assert.equal(attempts.filter((attempt) => attempt.status === "retry").length, 0);
+});
+
+test("OpenAI-compatible LLM adapter spaces concurrent calls with a shared endpoint limiter", async () => {
+  const attempts: LLMAttemptTrace[] = [];
+  const delays: number[] = [];
+  const fetchImpl: typeof fetch = async () => jsonResponse({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({
+            summary: "limited ok",
+            findings: [{ statement: "evidence is available", evidence_ids: ["ev-1"], confidence: 0.6 }],
+            assumptions: [],
+            open_questions: [],
+            confidence: 0.6,
+            structured_output: validThesisStructuredOutput(),
+            needs_revision: false,
+          }),
+        },
+      },
+    ],
+  });
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    requestMinIntervalMs: 50,
+    sharedStateKey: "shared-limiter-test",
+    delayImpl: async (ms) => {
+      if (ms > 0) delays.push(ms);
+    },
+  });
+
+  await Promise.all([
+    adapter.generateSubagentResult({ ...makeLLMRequest(), onLLMAttempt: (attempt) => attempts.push(attempt) }),
+    adapter.generateSubagentResult({ ...makeLLMRequest(), onLLMAttempt: (attempt) => attempts.push(attempt) }),
+  ]);
+
+  assert.equal(delays.length, 1);
+  assert.ok((delays[0] ?? 0) >= 45);
+  const rateLimitDelays = attempts.map((attempt) => attempt.rate_limit_delay_ms).sort((a, b) => (a ?? 0) - (b ?? 0));
+  assert.equal(rateLimitDelays[0], 0);
+  assert.ok((rateLimitDelays[1] ?? 0) >= 45);
+});
+
+test("OpenAI-compatible LLM adapter opens a shared circuit after repeated 5xx failures", async () => {
+  let callCount = 0;
+  const attempts: LLMAttemptTrace[] = [];
+  const fetchImpl: typeof fetch = async () => {
+    callCount += 1;
+    return new Response(JSON.stringify({ error: "temporary" }), {
+      status: 503,
+      statusText: "Service Unavailable",
+    });
+  };
+  const adapter = createOpenAICompatibleLLMAdapter({
+    apiKey: "test-key",
+    model: "test-model",
+    fetchImpl,
+    maxRetries: 1,
+    requestMinIntervalMs: 0,
+    retryBaseDelayMs: 0,
+    retryJitterRatio: 0,
+    circuitBreakerFailureThreshold: 2,
+    circuitBreakerOpenMs: 60_000,
+    sharedStateKey: "circuit-breaker-test",
+    delayImpl: async () => undefined,
+  });
+
+  const first = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    onLLMAttempt: (attempt) => attempts.push(attempt),
+  });
+  const second = await adapter.generateSubagentResult({
+    ...makeLLMRequest(),
+    onLLMAttempt: (attempt) => attempts.push(attempt),
+  });
+
+  assert.equal(first.needs_revision, true);
+  assert.equal(second.needs_revision, true);
+  assert.equal(callCount, 2);
+  assert.ok(attempts.some((attempt) => attempt.error_type === "LLMCircuitOpenError"));
 });
 
 test("OpenAI-compatible LLM adapter returns revision result after exhausted 5xx retries", async () => {
@@ -207,12 +396,14 @@ test("OpenAI-compatible LLM adapter returns revision result after exhausted 5xx 
     apiKey: "test-key",
     model: "test-model",
     fetchImpl,
+    requestMinIntervalMs: 0,
     maxRetries: 1,
     retryBaseDelayMs: 0,
+    retryJitterRatio: 0,
   });
   const result = await adapter.generateSubagentResult(makeLLMRequest());
 
-  assert.equal(callCount, 4);
+  assert.equal(callCount, 3);
   assert.equal(result.needs_revision, true);
   assert.match(result.data_gaps.map((gap) => gap.reason).join("\n"), /503/);
 });
@@ -222,6 +413,7 @@ test("OpenAI-compatible LLM adapter fails clearly without API key", async () => 
     apiKey: "",
     model: "test-model",
     fetchImpl: async () => jsonResponse({}),
+    requestMinIntervalMs: 0,
   });
 
   await assert.rejects(

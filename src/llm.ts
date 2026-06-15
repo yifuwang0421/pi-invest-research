@@ -1,6 +1,8 @@
 import type {
   DataGap,
   LLMAdapter,
+  LLMAttemptPhase,
+  LLMAttemptTrace,
   LLMGenerateRequest,
   SubagentResult,
   SubagentStructuredOutput,
@@ -47,6 +49,15 @@ export interface OpenAICompatibleLLMOptions {
   fetchImpl?: typeof fetch;
   maxRetries?: number;
   retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
+  retryJitterRatio?: number;
+  retryJitterMaxMs?: number;
+  requestMinIntervalMs?: number;
+  circuitBreakerFailureThreshold?: number;
+  circuitBreakerOpenMs?: number;
+  sharedStateKey?: string;
+  random?: () => number;
+  delayImpl?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export function createOpenAICompatibleLLMAdapter(options: OpenAICompatibleLLMOptions = {}): LLMAdapter {
@@ -72,6 +83,15 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
+  private readonly retryMaxDelayMs: number;
+  private readonly retryJitterRatio: number;
+  private readonly retryJitterMaxMs: number;
+  private readonly requestMinIntervalMs: number;
+  private readonly circuitBreakerFailureThreshold: number;
+  private readonly circuitBreakerOpenMs: number;
+  private readonly random: () => number;
+  private readonly delayImpl: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly sharedState: SharedEndpointState;
 
   constructor(options: OpenAICompatibleLLMOptions) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
@@ -80,6 +100,15 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.maxRetries = options.maxRetries ?? 2;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
+    this.retryMaxDelayMs = options.retryMaxDelayMs ?? 30_000;
+    this.retryJitterRatio = options.retryJitterRatio ?? 0.2;
+    this.retryJitterMaxMs = options.retryJitterMaxMs ?? 1_000;
+    this.requestMinIntervalMs = options.requestMinIntervalMs ?? readPositiveIntegerEnv("OPENAI_REQUEST_MIN_INTERVAL_MS", 6_000);
+    this.circuitBreakerFailureThreshold = options.circuitBreakerFailureThreshold ?? 3;
+    this.circuitBreakerOpenMs = options.circuitBreakerOpenMs ?? 60_000;
+    this.random = options.random ?? Math.random;
+    this.delayImpl = options.delayImpl ?? delay;
+    this.sharedState = getSharedEndpointState(options.sharedStateKey ?? `${this.baseUrl.replace(/\/$/, "")}/chat/completions`);
   }
 
   async generateSubagentResult(request: LLMGenerateRequest): Promise<SubagentResult> {
@@ -87,9 +116,11 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
       throw new Error("OPENAI_API_KEY is required for OpenAI-compatible LLM execution.");
     }
 
+    request.onLLMRetryBudget?.(Math.max(0, this.maxRetries));
     const messages = buildMessages(request);
+    const retryBudget = { remaining: Math.max(0, this.maxRetries) };
     try {
-      const first = await this.callModel(messages, request.signal);
+      const first = await this.callModel(messages, "initial", request, retryBudget);
       return parseAndNormalize(first, request);
     } catch (firstError) {
       const repairMessages: ChatMessage[] = [
@@ -105,7 +136,7 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
         },
       ];
       try {
-        const repaired = await this.callModel(repairMessages, request.signal);
+        const repaired = await this.callModel(repairMessages, "repair", request, retryBudget);
         return parseAndNormalize(repaired, request);
       } catch (secondError) {
         return buildLLMFailureResult(request, secondError);
@@ -113,12 +144,25 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
     }
   }
 
-  private async callModel(messages: ChatMessage[], signal?: AbortSignal): Promise<string> {
+  private async callModel(
+    messages: ChatMessage[],
+    phase: LLMAttemptPhase,
+    request: LLMGenerateRequest,
+    retryBudget: { remaining: number },
+  ): Promise<string> {
     const endpoint = `${this.baseUrl.replace(/\/$/, "")}/chat/completions`;
-    const maxAttempts = Math.max(1, this.maxRetries + 1);
+    let attempt = 0;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    while (true) {
+      const started = new Date();
+      let rateLimitDelayMs = 0;
       try {
+        this.sharedState.circuitBreaker.assertClosed(this.circuitBreakerOpenMs);
+        rateLimitDelayMs = await this.sharedState.rateLimiter.wait(
+          this.requestMinIntervalMs,
+          this.delayImpl,
+          request.signal,
+        );
         const init: RequestInit = {
           method: "POST",
           headers: {
@@ -131,15 +175,54 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
             messages,
           }),
         };
-        if (signal) init.signal = signal;
+        if (request.signal) init.signal = request.signal;
         const response = await this.fetchImpl(endpoint, init);
 
         if (!response.ok) {
           const error = new LLMHttpError(response.status, response.statusText, retryAfterMs(response.headers));
-          if (attempt < maxAttempts - 1 && isRetryableHttpStatus(response.status)) {
-            await delay(retryDelayMs(attempt, this.retryBaseDelayMs, error.retryAfterMs), signal);
+          const canRetry = retryBudget.remaining > 0 && isRetryableHttpStatus(response.status);
+          if (canRetry) {
+            retryBudget.remaining -= 1;
+            if (isCircuitBreakerFailureStatus(response.status)) {
+              this.sharedState.circuitBreaker.recordFailure(this.circuitBreakerFailureThreshold, this.circuitBreakerOpenMs);
+            }
+            const retryDelay = retryDelayMs(
+              attempt,
+              this.retryBaseDelayMs,
+              this.retryMaxDelayMs,
+              this.retryJitterRatio,
+              this.retryJitterMaxMs,
+              this.random,
+              error.retryAfterMs,
+            );
+            request.onLLMAttempt?.(buildAttemptTrace({
+              phase,
+              attempt,
+              started,
+              status: "retry",
+              httpStatus: response.status,
+              rateLimitDelayMs,
+              retryAfterMs: error.retryAfterMs,
+              retryDelayMs: retryDelay,
+              error,
+            }));
+            await this.delayImpl(retryDelay, request.signal);
+            attempt += 1;
             continue;
           }
+          if (isCircuitBreakerFailureStatus(response.status)) {
+            this.sharedState.circuitBreaker.recordFailure(this.circuitBreakerFailureThreshold, this.circuitBreakerOpenMs);
+          }
+          request.onLLMAttempt?.(buildAttemptTrace({
+            phase,
+            attempt,
+            started,
+            status: "failed",
+            httpStatus: response.status,
+            rateLimitDelayMs,
+            retryAfterMs: error.retryAfterMs,
+            error,
+          }));
           throw error;
         }
 
@@ -148,18 +231,68 @@ class OpenAICompatibleLLMAdapter implements LLMAdapter {
         if (!content) {
           throw new Error("LLM response had no message content.");
         }
+        this.sharedState.circuitBreaker.recordSuccess();
+        request.onLLMAttempt?.(buildAttemptTrace({
+          phase,
+          attempt,
+          started,
+          status: "success",
+          httpStatus: response.status,
+          rateLimitDelayMs,
+        }));
         return content;
       } catch (error) {
-        if (signal?.aborted || isAbortError(error)) throw error;
-        if (attempt < maxAttempts - 1 && isRetryableNetworkError(error)) {
-          await delay(retryDelayMs(attempt, this.retryBaseDelayMs), signal);
+        if (error instanceof LLMHttpError) throw error;
+        if (request.signal?.aborted || isAbortError(error)) {
+          request.onLLMAttempt?.(buildAttemptTrace({
+            phase,
+            attempt,
+            started,
+            status: "failed",
+            rateLimitDelayMs,
+            error,
+          }));
+          throw error;
+        }
+        const canRetry = retryBudget.remaining > 0 && isRetryableNetworkError(error);
+        if (canRetry) {
+          retryBudget.remaining -= 1;
+          this.sharedState.circuitBreaker.recordFailure(this.circuitBreakerFailureThreshold, this.circuitBreakerOpenMs);
+          const retryDelay = retryDelayMs(
+            attempt,
+            this.retryBaseDelayMs,
+            this.retryMaxDelayMs,
+            this.retryJitterRatio,
+            this.retryJitterMaxMs,
+            this.random,
+          );
+          request.onLLMAttempt?.(buildAttemptTrace({
+            phase,
+            attempt,
+            started,
+            status: "retry",
+            rateLimitDelayMs,
+            retryDelayMs: retryDelay,
+            error,
+          }));
+          await this.delayImpl(retryDelay, request.signal);
+          attempt += 1;
           continue;
         }
+        if (isRetryableNetworkError(error)) {
+          this.sharedState.circuitBreaker.recordFailure(this.circuitBreakerFailureThreshold, this.circuitBreakerOpenMs);
+        }
+        request.onLLMAttempt?.(buildAttemptTrace({
+          phase,
+          attempt,
+          started,
+          status: "failed",
+          rateLimitDelayMs,
+          error,
+        }));
         throw error;
       }
     }
-
-    throw new Error("LLM call failed without an execution attempt.");
   }
 }
 
@@ -173,8 +306,99 @@ class LLMHttpError extends Error {
   }
 }
 
+class LLMCircuitOpenError extends Error {
+  constructor(readonly openUntil: number) {
+    super(`LLM circuit breaker is open until ${new Date(openUntil).toISOString()}.`);
+    this.name = "LLMCircuitOpenError";
+  }
+}
+
+class SharedRateLimiter {
+  private nextReadyAt = 0;
+  private queue: Promise<void> = Promise.resolve();
+
+  async wait(
+    minIntervalMs: number,
+    delayImpl: (ms: number, signal?: AbortSignal) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    if (minIntervalMs <= 0) return 0;
+
+    const previous = this.queue;
+    let release: () => void = () => undefined;
+    this.queue = previous.then(() => new Promise<void>((resolve) => {
+      release = resolve;
+    }));
+
+    await previous;
+    const now = Date.now();
+    const scheduledAt = Math.max(now, this.nextReadyAt);
+    const waitMs = Math.max(0, scheduledAt - now);
+    this.nextReadyAt = scheduledAt + minIntervalMs;
+    release();
+
+    await delayImpl(waitMs, signal);
+    return waitMs;
+  }
+}
+
+class CircuitBreaker {
+  private consecutiveFailures = 0;
+  private openUntil = 0;
+
+  assertClosed(openMs: number): void {
+    const now = Date.now();
+    if (this.openUntil > now) {
+      throw new LLMCircuitOpenError(this.openUntil);
+    }
+    if (this.openUntil > 0 && this.openUntil <= now) {
+      this.openUntil = 0;
+      this.consecutiveFailures = 0;
+    }
+    if (openMs <= 0) {
+      this.openUntil = 0;
+    }
+  }
+
+  recordFailure(threshold: number, openMs: number): void {
+    if (threshold <= 0 || openMs <= 0) return;
+    this.consecutiveFailures += 1;
+    if (this.consecutiveFailures >= threshold) {
+      this.openUntil = Date.now() + Math.max(1, openMs);
+    }
+  }
+
+  recordSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.openUntil = 0;
+  }
+
+}
+
+interface SharedEndpointState {
+  rateLimiter: SharedRateLimiter;
+  circuitBreaker: CircuitBreaker;
+}
+
+const SHARED_ENDPOINT_STATES = new Map<string, SharedEndpointState>();
+
+function getSharedEndpointState(key: string): SharedEndpointState {
+  const existing = SHARED_ENDPOINT_STATES.get(key);
+  if (existing) return existing;
+  const created = {
+    rateLimiter: new SharedRateLimiter(),
+    circuitBreaker: new CircuitBreaker(),
+  };
+  SHARED_ENDPOINT_STATES.set(key, created);
+  return created;
+}
+
 function isRetryableHttpStatus(status: number): boolean {
   return status === 429 || status >= 500;
+}
+
+function isCircuitBreakerFailureStatus(status: number): boolean {
+  return status >= 500;
 }
 
 function isRetryableNetworkError(error: unknown): boolean {
@@ -195,9 +419,67 @@ function retryAfterMs(headers: Headers): number | undefined {
   return Math.max(0, timestamp - Date.now());
 }
 
-function retryDelayMs(attempt: number, baseDelayMs: number, retryAfter?: number): number {
-  if (retryAfter !== undefined) return retryAfter;
-  return Math.max(0, baseDelayMs * 2 ** attempt);
+function retryDelayMs(
+  attempt: number,
+  baseDelayMs: number,
+  maxDelayMs: number,
+  jitterRatio: number,
+  jitterMaxMs: number,
+  random: () => number,
+  retryAfter?: number,
+): number {
+  const exponential = Math.max(0, baseDelayMs * 2 ** attempt);
+  const cappedBase = Math.min(maxDelayMs, exponential);
+  const minimumDelay = retryAfter !== undefined ? Math.max(retryAfter, cappedBase) : cappedBase;
+  const jitterBase = retryAfter !== undefined ? minimumDelay : cappedBase;
+  const jitter = Math.min(Math.max(0, jitterMaxMs), jitterBase * Math.max(0, jitterRatio)) * random();
+  if (retryAfter !== undefined) return minimumDelay + jitter;
+  return Math.min(maxDelayMs, minimumDelay + jitter);
+}
+
+function buildAttemptTrace(input: {
+  phase: LLMAttemptPhase;
+  attempt: number;
+  started: Date;
+  status: LLMAttemptTrace["status"];
+  httpStatus?: number;
+  rateLimitDelayMs?: number;
+  retryAfterMs?: number | undefined;
+  retryDelayMs?: number | undefined;
+  error?: unknown;
+}): LLMAttemptTrace {
+  const completed = new Date();
+  return {
+    phase: input.phase,
+    attempt: input.attempt + 1,
+    status: input.status,
+    started_at: input.started.toISOString(),
+    completed_at: completed.toISOString(),
+    duration_ms: completed.getTime() - input.started.getTime(),
+    ...(input.httpStatus !== undefined ? { http_status: input.httpStatus } : {}),
+    ...(input.rateLimitDelayMs !== undefined ? { rate_limit_delay_ms: input.rateLimitDelayMs } : {}),
+    ...(input.retryAfterMs !== undefined ? { retry_after_ms: input.retryAfterMs } : {}),
+    ...(input.retryDelayMs !== undefined ? { retry_delay_ms: input.retryDelayMs } : {}),
+    ...(input.error ? { error_type: errorType(input.error), error_message: safeErrorMessage(input.error) } : {}),
+  };
+}
+
+function errorType(error: unknown): string {
+  if (error instanceof LLMHttpError) return "LLMHttpError";
+  if (error instanceof Error) return error.name || "Error";
+  return typeof error;
+}
+
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {

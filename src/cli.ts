@@ -10,6 +10,8 @@ interface CliArgs {
   out?: string;
   format?: OutputFormat;
   llmTimeoutMs?: number;
+  maxConcurrency?: number;
+  llmRetries?: number;
   useLiveIFind: boolean;
   fixture?: string | true;
 }
@@ -39,6 +41,8 @@ async function main(): Promise<void> {
     outputDir,
     mockLLM: usesFixture,
     ...(args.llmTimeoutMs !== undefined ? { llmTimeoutMs: args.llmTimeoutMs } : {}),
+    ...(args.maxConcurrency !== undefined ? { maxConcurrency: args.maxConcurrency } : {}),
+    ...(args.llmRetries !== undefined ? { llmRetries: args.llmRetries } : {}),
   };
   if (typeof args.fixture === "string") {
     runOptions.fixturePath = args.fixture;
@@ -109,6 +113,14 @@ function parseArgs(argv: string[]): CliArgs {
         args.llmTimeoutMs = requirePositiveInteger(requireValue(argv, index, token), token);
         index += 1;
         break;
+      case "--max-concurrency":
+        args.maxConcurrency = requireIntegerInRange(requireValue(argv, index, token), token, 1, 8);
+        index += 1;
+        break;
+      case "--llm-retries":
+        args.llmRetries = requireIntegerInRange(requireValue(argv, index, token), token, 0, 5);
+        index += 1;
+        break;
       case "--no-live-ifind":
         args.useLiveIFind = false;
         break;
@@ -150,6 +162,14 @@ function requirePositiveInteger(value: string, flag: string): number {
   return parsed;
 }
 
+function requireIntegerInRange(value: string, flag: string, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${flag} must be an integer between ${min} and ${max}.`);
+  }
+  return parsed;
+}
+
 function defaultOutputDir(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `reports/run-${stamp}`;
@@ -169,6 +189,8 @@ Options:
   --out <dir>            输出目录，默认 reports/run-<timestamp>
   --format <format>      markdown | json，默认 markdown
   --llm-timeout-ms <ms>  LLM subagent timeout in milliseconds, default 120000
+  --max-concurrency <n>  Max parallel subagents, 1-8, default 3
+  --llm-retries <n>      LLM HTTP/network retries per call phase, 0-5, default 2
   --no-live-ifind        不调用实时 iFinD
   --fixture [path]       使用 fixture 证据和 mock LLM 离线运行
 `);

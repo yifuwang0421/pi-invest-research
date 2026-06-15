@@ -7,6 +7,7 @@ import type {
   EvidenceProvider,
   FinalReport,
   LLMAdapter,
+  LLMAttemptTrace,
   NormalizedResearchRequest,
   ResearchDataAdapters,
   ResearchPlan,
@@ -62,6 +63,7 @@ export async function investResearch(
   const maxConcurrency = options.delegation?.max_concurrency ?? plan.delegation_policy.max_concurrency;
   const maxRevisionRounds = options.delegation?.max_revision_rounds ?? plan.delegation_policy.max_revision_rounds;
   const llmTimeoutMs = options.llmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
+  const effectivePlan = withEffectiveDelegationPolicy(plan, options.delegation ?? {}, maxConcurrency, maxRevisionRounds);
   const skillTextByAgent = options.skillTextByAgent ?? {};
   const delegated = await runDelegatedSubagentBatch(
     plan.tasks,
@@ -88,7 +90,7 @@ export async function investResearch(
     options.signal,
   );
 
-  return buildFinalReport(plan, revised.results, revised.reviews, revised.executions);
+  return buildFinalReport(effectivePlan, revised.results, revised.reviews, revised.executions);
 }
 
 export function buildResearchPlan(input: ResearchRequest): ResearchPlan {
@@ -167,6 +169,8 @@ export async function runSubagentTask(
   llmTimeoutMs = DEFAULT_LLM_TIMEOUT_MS,
   parentSignal?: AbortSignal,
   revisionContext?: SubagentRevisionContext,
+  onLLMRetryBudget?: (retryBudget: number) => void,
+  onLLMAttempt?: (attempt: LLMAttemptTrace) => void,
 ): Promise<SubagentResult> {
   let evidenceResult: Awaited<ReturnType<typeof collectEvidenceForTask>>;
   if (revisionContext) {
@@ -209,6 +213,8 @@ export async function runSubagentTask(
       })),
       ...(revisionContext ? { revision_context: revisionContext } : {}),
       ...(timeout.signal ? { signal: timeout.signal } : {}),
+      ...(onLLMRetryBudget ? { onLLMRetryBudget } : {}),
+      ...(onLLMAttempt ? { onLLMAttempt } : {}),
     };
     return await withTimeout(
       llmAdapter.generateSubagentResult(request),
@@ -510,6 +516,28 @@ function buildDelegationPolicy(taskCount: number): DelegationPolicy {
   };
 }
 
+function withEffectiveDelegationPolicy(
+  plan: ResearchPlan,
+  overrides: OrchestratorOptions["delegation"],
+  maxConcurrency: number,
+  maxRevisionRounds: number,
+): ResearchPlan {
+  return {
+    ...plan,
+    delegation_policy: {
+      ...plan.delegation_policy,
+      max_concurrency: Math.max(1, Math.floor(maxConcurrency)),
+      max_revision_rounds: Math.max(0, Math.floor(maxRevisionRounds)),
+      ...(overrides?.max_spawn_depth !== undefined
+        ? { max_spawn_depth: Math.max(0, Math.floor(overrides.max_spawn_depth)) }
+        : {}),
+      ...(overrides?.allow_nested_orchestrators !== undefined
+        ? { allow_nested_orchestrators: overrides.allow_nested_orchestrators }
+        : {}),
+    },
+  };
+}
+
 function buildStaticDelegationContext(
   agentId: SubagentId,
   target: string,
@@ -615,6 +643,8 @@ async function runTracedSubagentTask(
 ): Promise<{ task: SubagentTask; result: SubagentResult; execution: SubagentExecutionTrace }> {
   const started = new Date();
   const executionIds = buildExecutionIds(task.agent_id, taskIndex, revisionContext?.round);
+  const llmAttempts: LLMAttemptTrace[] = [];
+  let llmRetryBudget = 0;
   try {
     const result = await runSubagentTask(
       task,
@@ -626,8 +656,13 @@ async function runTracedSubagentTask(
       llmTimeoutMs,
       signal,
       revisionContext,
+      (retryBudget) => {
+        llmRetryBudget = retryBudget;
+      },
+      (attempt) => llmAttempts.push(attempt),
     );
     const completed = new Date();
+    const llmTrace = buildLLMTraceSummary(llmAttempts, llmRetryBudget);
     return {
       task,
       result,
@@ -642,12 +677,14 @@ async function runTracedSubagentTask(
         evidence_count: result.evidence.length,
         data_gap_count: result.data_gaps.length,
         upstream_agents: task.depends_on,
+        ...llmTrace,
         ...(revisionContext ? { revision_round: revisionContext.round, revision_of: task.agent_id } : {}),
         ...executionIds,
       },
     };
   } catch (error) {
     const completed = new Date();
+    const llmTrace = buildLLMTraceSummary(llmAttempts, llmRetryBudget);
     const result = createLLMErrorResult(task, [], [
       {
         source_name: "orchestrator",
@@ -670,12 +707,26 @@ async function runTracedSubagentTask(
         evidence_count: 0,
         data_gap_count: result.data_gaps.length,
         upstream_agents: task.depends_on,
+        ...llmTrace,
         ...(revisionContext ? { revision_round: revisionContext.round, revision_of: task.agent_id } : {}),
         error: error instanceof Error ? error.message : String(error),
         ...executionIds,
       },
     };
   }
+}
+
+function buildLLMTraceSummary(llmAttempts: LLMAttemptTrace[], llmRetryBudget: number): Pick<
+  SubagentExecutionTrace,
+  "llm_retry_budget" | "llm_attempt_count" | "llm_retry_count" | "llm_total_retry_delay_ms" | "llm_attempts"
+> {
+  return {
+    llm_retry_budget: llmRetryBudget,
+    llm_attempt_count: llmAttempts.length,
+    llm_retry_count: llmAttempts.filter((attempt) => attempt.status === "retry").length,
+    llm_total_retry_delay_ms: llmAttempts.reduce((sum, attempt) => sum + (attempt.retry_delay_ms ?? 0), 0),
+    llm_attempts: llmAttempts,
+  };
 }
 
 function buildExecutionIds(agentId: SubagentId, taskIndex: number, revisionRound?: number): Pick<
